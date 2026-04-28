@@ -1,0 +1,25 @@
+# Personal config (use config.example.json as template)
+config.json
+
+# Claude Code local settings
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log

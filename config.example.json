@@ -1,0 +1,9 @@
+{
+  "conflict_mode": "overwrite",
+  "ffmpeg_path": "ffmpeg",
+  "claude_path": "claude",
+  "claude_model": "claude-haiku-4-5",
+  "delete_originals_after_convert": true,
+  "recursive_translate": false,
+  "recursive_convert": true
+}
