@@ -22,6 +22,8 @@ from tkinter import ttk
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 IS_WINDOWS = sys.platform == "win32"
+# Suppress flashing console windows when shelling out from a pythonw GUI
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
 
 DEFAULT_CONFIG = {
     "conflict_mode": "rename",          # overwrite | rename | skip
@@ -158,7 +160,7 @@ def call_claude(prompt: str, claude_path: str, model: str, log) -> str | None:
             result = subprocess.run(
                 cmd, shell=True, input=prompt,
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=180,
+                timeout=180, creationflags=NO_WINDOW,
             )
         else:
             result = subprocess.run(
@@ -331,6 +333,7 @@ def convert_audio(root: Path, recursive: bool, conflict_mode: str,
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
                 encoding="utf-8", errors="replace",
+                creationflags=NO_WINDOW,
             )
         except FileNotFoundError:
             log(f"[오류] ffmpeg를 찾을 수 없습니다: {ffmpeg_path}")
