@@ -12,6 +12,8 @@ import shutil
 import subprocess
 import sys
 import threading
+import urllib.error
+import urllib.request
 from pathlib import Path
 from tkinter import (
     BOTH, END, LEFT, RIGHT, X, Y, W, E,
@@ -33,6 +35,11 @@ DEFAULT_CONFIG = {
     "delete_originals_after_convert": False,
     "recursive_translate": False,
     "recursive_convert": False,
+    # Translation engine: "claude" (CLI) | "gemma4" (local koboldcpp at OpenAI-compatible endpoint)
+    "translate_engine": "claude",
+    "gemma4_url": "http://localhost:5001/v1/chat/completions",
+    "gemma4_temperature": 0.1,
+    "gemma4_repeat_penalty": 1.05,
 }
 
 JAPANESE_RE = re.compile(r"[぀-ゟ゠-ヿ一-鿿]")
@@ -185,20 +192,79 @@ def call_claude(prompt: str, claude_path: str, model: str, log) -> str | None:
     return (result.stdout or "").strip()
 
 
-def translate_batch(items: list[str], claude_path: str, model: str, log) -> dict[str, str]:
+def call_gemma4(prompt: str, url: str, temperature: float, repeat_penalty: float, log) -> str | None:
+    """POST to a koboldcpp / OpenAI-compatible /v1/chat/completions endpoint."""
+    body = {
+        "model": "local",
+        "temperature": temperature,
+        "repeat_penalty": repeat_penalty,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "당신은 일본어 파일/폴더 이름을 한국어로 번역하는 도우미입니다. "
+                    "사용자의 지시에 따라 반드시 JSON 형식으로만 응답합니다."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+    }
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError as e:
+        log(f"  [오류] gemma4 서버 연결 실패 ({url}): {e}")
+        return None
+    except Exception as e:
+        log(f"  [오류] gemma4 호출 실패: {e}")
+        return None
+
+    try:
+        return (payload["choices"][0]["message"]["content"] or "").strip()
+    except (KeyError, IndexError, TypeError) as e:
+        log(f"  [오류] gemma4 응답 형식 오류: {e}")
+        return None
+
+
+def call_translation_engine(prompt: str, cfg: dict, log) -> str | None:
+    """Dispatch to the active translation engine based on cfg['translate_engine']."""
+    engine = cfg.get("translate_engine", "claude")
+    if engine == "gemma4":
+        return call_gemma4(
+            prompt,
+            cfg.get("gemma4_url", DEFAULT_CONFIG["gemma4_url"]),
+            float(cfg.get("gemma4_temperature", DEFAULT_CONFIG["gemma4_temperature"])),
+            float(cfg.get("gemma4_repeat_penalty", DEFAULT_CONFIG["gemma4_repeat_penalty"])),
+            log,
+        )
+    return call_claude(
+        prompt,
+        cfg.get("claude_path", DEFAULT_CONFIG["claude_path"]),
+        cfg.get("claude_model", DEFAULT_CONFIG["claude_model"]),
+        log,
+    )
+
+
+def translate_batch(items: list[str], cfg: dict, log) -> dict[str, str]:
     if not items:
         return {}
     numbered = "\n".join(f"{i + 1}. {name}" for i, name in enumerate(items))
     prompt = (
-        "다음은 일본어가 포함된 파일 또는 폴더 이름 목록입니다. "
+        "다음은 일본어가 포함된 파일/폴더 이름의 본체(확장자 제외) 목록입니다. "
         "각 항목을 자연스러운 한국어로 번역해 주세요. "
-        "파일 확장자가 있다면 그대로 유지하고, 윈도우 파일명에 사용할 수 없는 문자(<>:\"/\\|?*)는 사용하지 마세요. "
+        "확장자(.txt, .mp3 등)는 절대 추가하지 말고, "
+        "윈도우 파일명에 사용할 수 없는 문자(<>:\"/\\|?*)도 사용하지 마세요. "
         "응답은 반드시 아래 JSON 형식 한 가지로만 출력하세요. 설명, 코드블록 표시(```), 주석은 절대 포함하지 마세요.\n\n"
         '{"translations": ["번역결과1", "번역결과2", ...]}\n\n'
         f"항목 ({len(items)}개):\n{numbered}"
     )
 
-    output = call_claude(prompt, claude_path, model, log)
+    output = call_translation_engine(prompt, cfg, log)
     if not output:
         return {}
 
@@ -220,8 +286,19 @@ def translate_batch(items: list[str], claude_path: str, model: str, log) -> dict
     return dict(zip(items, translations))
 
 
+def _translate_key(p: Path) -> tuple[str, bool]:
+    """Return (translation_key, is_stem).
+    - Files where the stem has Japanese → translate only the stem; suffix is reattached after.
+      This guarantees same-stem-different-suffix files share one translation result.
+    - Folders, or files with Japanese only in the suffix → translate full name.
+    """
+    if not p.is_dir() and has_japanese(p.stem):
+        return p.stem, True
+    return p.name, False
+
+
 def translate_folder(root: Path, recursive: bool, conflict_mode: str,
-                     claude_path: str, model: str, log, progress) -> None:
+                     cfg: dict, log, progress) -> None:
     if not root.is_dir():
         log(f"[오류] {root}은(는) 폴더가 아닙니다.")
         return
@@ -244,9 +321,12 @@ def translate_folder(root: Path, recursive: bool, conflict_mode: str,
         log("[번역] 일본어 이름이 포함된 항목이 없습니다.")
         return
 
-    log(f"[번역] {len(items)}개 항목 발견.")
+    engine = cfg.get("translate_engine", "claude")
+    log(f"[번역] {len(items)}개 항목 발견. (엔진: {engine})")
 
-    unique = list(dict.fromkeys(p.name for p in items))
+    # Dedup by translation key (stem for files w/ JP stem; full name otherwise).
+    keys = [_translate_key(p)[0] for p in items]
+    unique = list(dict.fromkeys(keys))
     total_batches = (len(unique) + TRANSLATE_BATCH - 1) // TRANSLATE_BATCH
     progress(0, total_batches, "번역 요청 중")
 
@@ -254,7 +334,7 @@ def translate_folder(root: Path, recursive: bool, conflict_mode: str,
     for bi, i in enumerate(range(0, len(unique), TRANSLATE_BATCH)):
         batch = unique[i:i + TRANSLATE_BATCH]
         log(f"  요청: {i + 1}-{i + len(batch)} / {len(unique)}")
-        name_map.update(translate_batch(batch, claude_path, model, log))
+        name_map.update(translate_batch(batch, cfg, log))
         progress(bi + 1, total_batches, "번역 요청 중")
 
     if not name_map:
@@ -264,9 +344,12 @@ def translate_folder(root: Path, recursive: bool, conflict_mode: str,
     progress(0, len(items), "이름 변경 중")
     renamed = skipped = failed = 0
     for idx, path in enumerate(items):
-        translated = name_map.get(path.name)
+        key, is_stem = _translate_key(path)
+        translated = name_map.get(key)
         if translated:
-            new_name = safe_filename(translated)
+            cleaned = safe_filename(translated)
+            # Reattach the original suffix when we translated only the stem.
+            new_name = cleaned + path.suffix if is_stem else cleaned
             if new_name and new_name != path.name:
                 target = path.parent / new_name
                 dest = resolve_conflict(target, conflict_mode)
@@ -413,6 +496,12 @@ class App:
         e3.grid(row=3, column=1, columnspan=3, sticky=W + E, padx=6)
         e3.bind("<FocusOut>", lambda _e: self._save_settings())
 
+        Label(settings, text="gemma4 URL:").grid(row=4, column=0, sticky=W, padx=6, pady=4)
+        self.gemma4_url_var = StringVar(value=self.cfg["gemma4_url"])
+        e4 = Entry(settings, textvariable=self.gemma4_url_var)
+        e4.grid(row=4, column=1, columnspan=3, sticky=W + E, padx=6)
+        e4.bind("<FocusOut>", lambda _e: self._save_settings())
+
         settings.columnconfigure(3, weight=1)
 
         # --- feature 1 ---
@@ -426,7 +515,7 @@ class App:
         Button(row1, text="실행", command=self._run_flatten, width=8).pack(side=LEFT)
 
         # --- feature 2 ---
-        f2 = ttk.LabelFrame(outer, text="2. 일본어 → 한국어 이름 번역 (claude haiku)")
+        f2 = ttk.LabelFrame(outer, text="2. 일본어 → 한국어 이름 번역")
         f2.pack(fill=X, pady=4)
         self.translate_path = StringVar()
         row2 = Frame(f2)
@@ -434,11 +523,24 @@ class App:
         Entry(row2, textvariable=self.translate_path).pack(side=LEFT, fill=X, expand=True)
         Button(row2, text="폴더 선택", command=lambda: self._pick(self.translate_path)).pack(side=LEFT, padx=4)
         Button(row2, text="실행", command=self._run_translate, width=8).pack(side=LEFT)
+
+        opts2 = Frame(f2)
+        opts2.pack(fill=X, padx=6, pady=(0, 6))
+        Label(opts2, text="엔진:").pack(side=LEFT)
+        self.engine_var = StringVar(value=self.cfg.get("translate_engine", "claude"))
+        Radiobutton(
+            opts2, text="Claude (CLI)", variable=self.engine_var, value="claude",
+            command=self._save_settings,
+        ).pack(side=LEFT, padx=(4, 8))
+        Radiobutton(
+            opts2, text="Gemma4 (local)", variable=self.engine_var, value="gemma4",
+            command=self._save_settings,
+        ).pack(side=LEFT)
         self.translate_recursive = IntVar(value=int(self.cfg["recursive_translate"]))
         Checkbutton(
-            f2, text="하위 폴더까지 처리", variable=self.translate_recursive,
+            opts2, text="하위 폴더까지 처리", variable=self.translate_recursive,
             command=self._save_settings,
-        ).pack(anchor=W, padx=6, pady=(0, 6))
+        ).pack(side=LEFT, padx=(20, 0))
 
         # --- feature 3 ---
         f3 = ttk.LabelFrame(outer, text="3. WAV / FLAC → MP3 변환 (ffmpeg)")
@@ -514,6 +616,8 @@ class App:
             "ffmpeg_path": self.ffmpeg_var.get(),
             "claude_path": self.claude_var.get(),
             "claude_model": self.model_var.get(),
+            "gemma4_url": self.gemma4_url_var.get(),
+            "translate_engine": self.engine_var.get(),
             "recursive_translate": bool(self.translate_recursive.get()),
             "recursive_convert": bool(self.audio_recursive.get()),
             "delete_originals_after_convert": bool(self.delete_original.get()),
@@ -574,8 +678,7 @@ class App:
             Path(path),
             bool(self.translate_recursive.get()),
             self.conflict_var.get(),
-            self.claude_var.get(),
-            self.model_var.get(),
+            self.cfg,
             self._log,
             self._set_progress,
         ))
