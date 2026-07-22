@@ -40,11 +40,14 @@ DEFAULT_CONFIG = {
     "gemma4_url": "http://localhost:5001/v1/chat/completions",
     "gemma4_temperature": 0.1,
     "gemma4_repeat_penalty": 1.05,
+    # Cap on generated tokens per request. Long file names need plenty of room
+    # or the JSON reply gets cut off mid-array and fails to parse.
+    "gemma4_max_tokens": 4096,
 }
 
 JAPANESE_RE = re.compile(r"[぀-ゟ゠-ヿ一-鿿]")
 ILLEGAL_FN_CHARS = '<>:"/\\|?*'
-TRANSLATE_BATCH = 20
+TRANSLATE_BATCH = 10
 
 
 # ---------- config ----------
@@ -192,12 +195,14 @@ def call_claude(prompt: str, claude_path: str, model: str, log) -> str | None:
     return (result.stdout or "").strip()
 
 
-def call_gemma4(prompt: str, url: str, temperature: float, repeat_penalty: float, log) -> str | None:
+def call_gemma4(prompt: str, url: str, temperature: float, repeat_penalty: float,
+                max_tokens: int, log) -> str | None:
     """POST to a koboldcpp / OpenAI-compatible /v1/chat/completions endpoint."""
     body = {
         "model": "local",
         "temperature": temperature,
         "repeat_penalty": repeat_penalty,
+        "max_tokens": max_tokens,
         "messages": [
             {
                 "role": "system",
@@ -225,10 +230,16 @@ def call_gemma4(prompt: str, url: str, temperature: float, repeat_penalty: float
         return None
 
     try:
-        return (payload["choices"][0]["message"]["content"] or "").strip()
+        choice = payload["choices"][0]
+        content = (choice["message"]["content"] or "").strip()
     except (KeyError, IndexError, TypeError) as e:
         log(f"  [오류] gemma4 응답 형식 오류: {e}")
         return None
+
+    if choice.get("finish_reason") == "length":
+        log(f"  [경고] 응답이 max_tokens({max_tokens})에 걸려 잘렸습니다. "
+            "더 작은 배치로 재시도하거나 config.json의 gemma4_max_tokens를 늘리세요.")
+    return content
 
 
 def call_translation_engine(prompt: str, cfg: dict, log) -> str | None:
@@ -240,6 +251,7 @@ def call_translation_engine(prompt: str, cfg: dict, log) -> str | None:
             cfg.get("gemma4_url", DEFAULT_CONFIG["gemma4_url"]),
             float(cfg.get("gemma4_temperature", DEFAULT_CONFIG["gemma4_temperature"])),
             float(cfg.get("gemma4_repeat_penalty", DEFAULT_CONFIG["gemma4_repeat_penalty"])),
+            int(cfg.get("gemma4_max_tokens", DEFAULT_CONFIG["gemma4_max_tokens"])),
             log,
         )
     return call_claude(

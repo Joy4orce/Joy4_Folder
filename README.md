@@ -55,6 +55,7 @@ copy config.example.json config.json
 | `gemma4_url` | Gemma4(OpenAI 호환) 엔드포인트 | `http://localhost:5001/v1/chat/completions` |
 | `gemma4_temperature` | Gemma4 temperature | `0.1` |
 | `gemma4_repeat_penalty` | Gemma4 repeat penalty | `1.05` |
+| `gemma4_max_tokens` | Gemma4 요청당 최대 생성 토큰. 파일명이 길면 응답이 잘리므로 넉넉히 필요 | `4096` |
 
 ## 주의
 

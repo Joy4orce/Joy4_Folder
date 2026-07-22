@@ -9,5 +9,6 @@
   "translate_engine": "claude",
   "gemma4_url": "http://localhost:5001/v1/chat/completions",
   "gemma4_temperature": 0.1,
-  "gemma4_repeat_penalty": 1.05
+  "gemma4_repeat_penalty": 1.05,
+  "gemma4_max_tokens": 4096
 }
