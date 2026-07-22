@@ -6,6 +6,7 @@
   "delete_originals_after_convert": true,
   "recursive_translate": false,
   "recursive_convert": true,
+  "recursive_subtitle": false,
   "translate_engine": "claude",
   "gemma4_url": "http://localhost:5001/v1/chat/completions",
   "gemma4_temperature": 0.1,

@@ -35,6 +35,7 @@ DEFAULT_CONFIG = {
     "delete_originals_after_convert": False,
     "recursive_translate": False,
     "recursive_convert": False,
+    "recursive_subtitle": False,
     # Translation engine: "claude" (CLI) | "gemma4" (local koboldcpp at OpenAI-compatible endpoint)
     "translate_engine": "claude",
     "gemma4_url": "http://localhost:5001/v1/chat/completions",
@@ -48,6 +49,15 @@ DEFAULT_CONFIG = {
 JAPANESE_RE = re.compile(r"[぀-ゟ゠-ヿ一-鿿]")
 ILLEGAL_FN_CHARS = '<>:"/\\|?*'
 TRANSLATE_BATCH = 10
+
+# Subtitle files sometimes carry the media extension too (name.mp3.vtt) and then
+# fail to pair with the media file (name.mp3). Stripping the embedded media
+# extension fixes it (name.vtt).
+SUBTITLE_EXTS = (".vtt", ".srt", ".ass", ".ssa", ".smi", ".sub", ".lrc", ".sbv")
+MEDIA_EXTS = (
+    ".mp3", ".mp4", ".mkv", ".avi", ".flac", ".wav", ".m4a", ".webm", ".mov",
+    ".wmv", ".flv", ".opus", ".aac", ".ogg", ".m4v", ".ts", ".mpg", ".mpeg",
+)
 
 
 # ---------- config ----------
@@ -489,6 +499,68 @@ def convert_audio(root: Path, recursive: bool, conflict_mode: str,
     log(f"[변환 완료] 성공 {converted}개 / 건너뛰기 {skipped}개 / 실패 {failed}개")
 
 
+# ---------- feature 4: fix subtitle names ----------
+
+def strip_media_ext_from_subtitle(name: str) -> str | None:
+    """'파일명.mp3.vtt' -> '파일명.vtt'. Returns the fixed name, or None if the
+    name is not a subtitle carrying an embedded media extension."""
+    p = Path(name)
+    if p.suffix.lower() not in SUBTITLE_EXTS:
+        return None
+    inner = Path(p.stem)  # e.g. '파일명.mp3'
+    if inner.suffix.lower() not in MEDIA_EXTS:
+        return None
+    fixed = inner.stem + p.suffix  # '파일명' + '.vtt'
+    if not inner.stem or fixed == name:
+        return None
+    return fixed
+
+
+def fix_subtitle_names(root: Path, recursive: bool, conflict_mode: str,
+                       log, progress) -> None:
+    if not root.is_dir():
+        log(f"[오류] {root}은(는) 폴더가 아닙니다.")
+        return
+
+    targets: list[Path] = []
+    if recursive:
+        for cur, _subs, files in os.walk(root):
+            for f in files:
+                if strip_media_ext_from_subtitle(f):
+                    targets.append(Path(cur) / f)
+    else:
+        for entry in root.iterdir():
+            if entry.is_file() and strip_media_ext_from_subtitle(entry.name):
+                targets.append(entry)
+
+    if not targets:
+        log("[자막] 고칠 자막 파일이 없습니다. (예: 이름.mp3.vtt)")
+        return
+
+    log(f"[자막] {len(targets)}개 자막 파일 발견.")
+    progress(0, len(targets), "이름 변경 중")
+    renamed = skipped = failed = 0
+
+    for idx, src in enumerate(targets):
+        new_name = strip_media_ext_from_subtitle(src.name)
+        target = src.parent / new_name
+        dest = resolve_conflict(target, conflict_mode)
+        if dest is None:
+            log(f"  건너뛰기: {src.name} → {new_name} (대상 존재)")
+            skipped += 1
+        else:
+            try:
+                src.rename(dest)
+                log(f"  이름변경: {src.name}  →  {dest.name}")
+                renamed += 1
+            except Exception as e:
+                log(f"  [실패] {src}: {e}")
+                failed += 1
+        progress(idx + 1, len(targets), "이름 변경 중")
+
+    log(f"[자막 완료] 이름변경 {renamed}개 / 건너뛰기 {skipped}개 / 실패 {failed}개")
+
+
 # ---------- GUI ----------
 
 class App:
@@ -500,8 +572,8 @@ class App:
 
     def _build_ui(self) -> None:
         self.root.title("Joy4_Folder")
-        self.root.geometry("860x900")
-        self.root.minsize(700, 760)
+        self.root.geometry("860x980")
+        self.root.minsize(700, 820)
 
         outer = Frame(self.root, padx=10, pady=10)
         outer.pack(fill=BOTH, expand=True)
@@ -608,6 +680,23 @@ class App:
             command=self._save_settings,
         ).pack(side=LEFT, padx=(20, 0))
 
+        # --- feature 4 ---
+        f4 = ttk.LabelFrame(outer, text="4. 자막 파일명 맞추기 (예: 이름.mp3.vtt → 이름.vtt)")
+        f4.pack(fill=X, pady=4)
+        self.subtitle_path = StringVar()
+        row4 = Frame(f4)
+        row4.pack(fill=X, padx=6, pady=6)
+        Entry(row4, textvariable=self.subtitle_path).pack(side=LEFT, fill=X, expand=True)
+        Button(row4, text="폴더 선택", command=lambda: self._pick(self.subtitle_path)).pack(side=LEFT, padx=4)
+        Button(row4, text="실행", command=self._run_fix_subs, width=8).pack(side=LEFT)
+        opts4 = Frame(f4)
+        opts4.pack(fill=X, padx=6, pady=(0, 6))
+        self.subtitle_recursive = IntVar(value=int(self.cfg["recursive_subtitle"]))
+        Checkbutton(
+            opts4, text="하위 폴더까지 처리", variable=self.subtitle_recursive,
+            command=self._save_settings,
+        ).pack(side=LEFT)
+
         # --- log ---
         logframe = ttk.LabelFrame(outer, text="로그")
         logframe.pack(fill=BOTH, expand=True, pady=(8, 0))
@@ -664,6 +753,7 @@ class App:
             "translate_engine": self.engine_var.get(),
             "recursive_translate": bool(self.translate_recursive.get()),
             "recursive_convert": bool(self.audio_recursive.get()),
+            "recursive_subtitle": bool(self.subtitle_recursive.get()),
             "delete_originals_after_convert": bool(self.delete_original.get()),
         })
         save_config(self.cfg)
@@ -742,6 +832,23 @@ class App:
             self.conflict_var.get(),
             self.ffmpeg_var.get(),
             bool(self.delete_original.get()),
+            self._log,
+            self._set_progress,
+        ))
+
+    def _run_fix_subs(self) -> None:
+        path = self.subtitle_path.get().strip()
+        if not path:
+            messagebox.showwarning("경고", "폴더를 선택하세요.")
+            return
+        if not Path(path).is_dir():
+            messagebox.showerror("오류", "유효한 폴더가 아닙니다.")
+            return
+        self._save_settings()
+        self._run_threaded("자막 파일명 맞추기", lambda: fix_subtitle_names(
+            Path(path),
+            bool(self.subtitle_recursive.get()),
+            self.conflict_var.get(),
             self._log,
             self._set_progress,
         ))

@@ -1,12 +1,13 @@
 # Joy4_Folder
 
-일본어 자료 폴더를 정리하기 위한 Windows용 tkinter GUI 유틸리티입니다. 세 가지 기능을 한 창에서 제공합니다.
+일본어 자료 폴더를 정리하기 위한 Windows용 tkinter GUI 유틸리티입니다. 네 가지 기능을 한 창에서 제공합니다.
 
 1. **하위폴더 펼치기** — 선택한 폴더의 모든 하위폴더 내용물을 최상위로 꺼내고, 비게 된 하위폴더를 삭제합니다.
 2. **일본어 → 한국어 이름 번역** — 일본어가 포함된 파일/폴더 이름을 자연스러운 한국어로 바꿉니다. 번역 엔진은 두 가지 중 선택할 수 있습니다.
    - `claude` — Claude CLI(`claude -p --model ...`)를 통해 번역
    - `gemma4` — 로컬 koboldcpp 등 OpenAI 호환 `/v1/chat/completions` 엔드포인트로 번역
 3. **WAV / FLAC → MP3 변환** — ffmpeg(libmp3lame, `-qscale:a 2`)로 오디오를 변환합니다. 선택적으로 원본 삭제 가능.
+4. **자막 파일명 맞추기** — `이름.mp3.vtt`처럼 미디어 확장자가 끼어든 자막 파일명에서 그 부분을 제거해(`이름.vtt`) 미디어 파일과 짝이 맞도록 합니다. 자막 확장자(`.vtt .srt .ass .ssa .smi .sub .lrc .sbv`) 앞에 미디어 확장자(`.mp3 .mp4 .mkv .flac` 등)가 붙은 경우만 처리하며, 그 외 이름은 건드리지 않습니다.
 
 공통 옵션으로 이름 충돌 처리 방식(덮어쓰기 / 숫자 붙이기 / 건너뛰기)과 하위 폴더 재귀 처리 여부를 지정할 수 있습니다.
 
@@ -51,6 +52,7 @@ copy config.example.json config.json
 | `delete_originals_after_convert` | 변환 후 원본 삭제 | `false` |
 | `recursive_translate` | 번역 시 하위 폴더까지 처리 | `false` |
 | `recursive_convert` | 변환 시 하위 폴더까지 처리 | `false` |
+| `recursive_subtitle` | 자막 파일명 맞추기 시 하위 폴더까지 처리 | `false` |
 | `translate_engine` | 번역 엔진: `claude` / `gemma4` | `claude` |
 | `gemma4_url` | Gemma4(OpenAI 호환) 엔드포인트 | `http://localhost:5001/v1/chat/completions` |
 | `gemma4_temperature` | Gemma4 temperature | `0.1` |
