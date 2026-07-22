@@ -280,10 +280,50 @@ def translate_batch(items: list[str], cfg: dict, log) -> dict[str, str]:
 
     translations = parsed.get("translations") or []
     if len(translations) != len(items):
-        log(f"  [경고] 번역 개수 불일치: 입력 {len(items)} / 출력 {len(translations)}")
-        n = min(len(items), len(translations))
-        return dict(zip(items[:n], translations[:n]))
+        # Positional zip would misalign every item after a dropped one (wrong
+        # names), so discard the whole batch and let translate_names() re-request
+        # it in smaller chunks where alignment is reliable.
+        log(f"  [경고] 번역 개수 불일치: 입력 {len(items)} / 출력 {len(translations)} — 재시도합니다")
+        return {}
     return dict(zip(items, translations))
+
+
+def translate_names(keys: list[str], cfg: dict, log, progress) -> dict[str, str]:
+    """Translate every key, retrying any that come back missing or empty in
+    progressively smaller batches.
+
+    Local models often return a mismatched item count or unparseable JSON for a
+    full batch, which drops entries silently — folder names included. Shrinking
+    the batch on each retry (down to 1) makes the response reliable and recovers
+    the dropped items instead of leaving them untranslated.
+    """
+    result: dict[str, str] = {}
+    pending = list(dict.fromkeys(keys))
+    batch_size = TRANSLATE_BATCH
+    max_rounds = 4
+    for round_no in range(1, max_rounds + 1):
+        if not pending:
+            break
+        label = "번역 요청 중" if round_no == 1 else "미번역 재요청 중"
+        if round_no > 1:
+            log(f"  [재시도 {round_no - 1}] 미번역 {len(pending)}개 재요청 (배치 크기 {batch_size})")
+        total_batches = (len(pending) + batch_size - 1) // batch_size
+        progress(0, total_batches, label)
+        for bi, i in enumerate(range(0, len(pending), batch_size)):
+            batch = pending[i:i + batch_size]
+            if round_no == 1:
+                log(f"  요청: {i + 1}-{i + len(batch)} / {len(pending)}")
+            for k, v in translate_batch(batch, cfg, log).items():
+                if v and v.strip():
+                    result[k] = v
+            progress(bi + 1, total_batches, label)
+        pending = [k for k in pending if k not in result]
+        batch_size = max(1, batch_size // 2)
+
+    if pending:
+        preview = ", ".join(pending[:10]) + (" ..." if len(pending) > 10 else "")
+        log(f"  [번역 안 됨] {len(pending)}개 항목을 끝내 번역하지 못했습니다: {preview}")
+    return result
 
 
 def _translate_key(p: Path) -> tuple[str, bool]:
@@ -327,15 +367,7 @@ def translate_folder(root: Path, recursive: bool, conflict_mode: str,
     # Dedup by translation key (stem for files w/ JP stem; full name otherwise).
     keys = [_translate_key(p)[0] for p in items]
     unique = list(dict.fromkeys(keys))
-    total_batches = (len(unique) + TRANSLATE_BATCH - 1) // TRANSLATE_BATCH
-    progress(0, total_batches, "번역 요청 중")
-
-    name_map: dict[str, str] = {}
-    for bi, i in enumerate(range(0, len(unique), TRANSLATE_BATCH)):
-        batch = unique[i:i + TRANSLATE_BATCH]
-        log(f"  요청: {i + 1}-{i + len(batch)} / {len(unique)}")
-        name_map.update(translate_batch(batch, cfg, log))
-        progress(bi + 1, total_batches, "번역 요청 중")
+    name_map = translate_names(unique, cfg, log, progress)
 
     if not name_map:
         log("[번역 실패] 처리할 결과가 없습니다.")
