@@ -37,6 +37,8 @@ DEFAULT_CONFIG = {
     "recursive_convert": False,
     "recursive_subtitle": False,
     "recursive_dedup": True,
+    # In dedup, also pop up name-paired siblings whose contents differ.
+    "dedup_name_only": True,
     # Translation engine: "claude" (CLI) | "gemma4" (local koboldcpp at OpenAI-compatible endpoint)
     "translate_engine": "claude",
     "gemma4_url": "http://localhost:5001/v1/chat/completions",
@@ -627,13 +629,38 @@ def decide_group_victims(names: list[str]) -> tuple[list[str], str]:
     return [], ""
 
 
-def scan_duplicate_folders(root: Path, recursive: bool) -> tuple[list, list]:
+def name_variant_group(subs: list[Path]) -> list[Path]:
+    """Sibling folders whose NAMES look like a keep/delete variant pair, used
+    when their contents do NOT overlap (so auto-delete is unsafe and we ask
+    instead). Requires markers on both sides so unrelated folders aren't
+    flagged. Returns the marker-bearing folders, or [] if there's no clear pair.
+    """
+    neg = [s for s in subs if any(m in s.name for m in DUP_NEGATIVE_MARKERS)]
+    pos = [s for s in subs if any(m in s.name for m in DUP_POSITIVE_MARKERS)]
+    if neg and pos:
+        return [s for s in subs if s in neg or s in pos]
+
+    low = {s: s.name.lower() for s in subs}
+    wavs = [s for s in subs if "wav" in low[s] and "mp3" not in low[s]]
+    mp3s = [s for s in subs if "mp3" in low[s]]
+    if wavs and mp3s:
+        return mp3s + wavs
+
+    return []
+
+
+def scan_duplicate_folders(root: Path, recursive: bool,
+                           include_name_only: bool = True) -> tuple[list, list]:
     """Walk the tree and classify duplicate sibling folders.
 
     Returns (auto, ambiguous):
       auto      = [(victim: Path, keeper_name: str, reason: str)] decided by rules
-      ambiguous = [cluster: list[Path]] duplicates a rule could not resolve
-    Only folders with overlapping contents are ever considered.
+      ambiguous = [cluster: list[Path]] left for the user to decide
+
+    Folders whose contents overlap are matched by rules (auto) or, if a rule
+    can't decide, surfaced for the user. When include_name_only is set, sibling
+    folders whose names look like a variant pair but whose contents DIFFER are
+    also surfaced for the user (never auto-deleted, since contents differ).
     """
     auto: list[tuple[Path, str, str]] = []
     ambiguous: list[list[Path]] = []
@@ -655,6 +682,7 @@ def scan_duplicate_folders(root: Path, recursive: bool) -> tuple[list, list]:
         if len(subs) < 2:
             continue
 
+        handled: set[Path] = set()
         for cluster in cluster_duplicate_folders(subs, stems):
             names = [c.name for c in cluster]
             victim_names, reason = decide_group_victims(names)
@@ -666,6 +694,14 @@ def scan_duplicate_folders(root: Path, recursive: bool) -> tuple[list, list]:
             # Duplicates left undecided among the keepers still need a human.
             if len(keepers) >= 2:
                 ambiguous.append(keepers)
+            handled.update(cluster)
+
+        # Name-paired siblings whose contents differ: ask, don't auto-delete.
+        if include_name_only:
+            remaining = [s for s in subs if s not in handled]
+            nv = name_variant_group(remaining)
+            if len(nv) >= 2:
+                ambiguous.append(nv)
 
     return auto, ambiguous
 
@@ -882,10 +918,15 @@ class App:
             opts5, text="하위 폴더까지 탐색", variable=self.dedup_recursive,
             command=self._save_settings,
         ).pack(side=LEFT)
-        Label(
-            opts5, text="mp3>wav · '있음/포함' 우선, '없음/제거' 삭제 · 판단 불가 시 직접 선택",
-            fg="#777",
+        self.dedup_name_only = IntVar(value=int(self.cfg["dedup_name_only"]))
+        Checkbutton(
+            opts5, text="내용이 달라도 이름이 짝이면 확인", variable=self.dedup_name_only,
+            command=self._save_settings,
         ).pack(side=LEFT, padx=(16, 0))
+        Label(
+            f5, text="mp3>wav · '있음/포함' 우선, '없음/제거' 삭제 · 판단 불가 시 직접 선택",
+            fg="#777",
+        ).pack(fill=X, padx=6, pady=(0, 6), anchor=W)
 
         # --- log ---
         logframe = ttk.LabelFrame(outer, text="로그")
@@ -945,6 +986,7 @@ class App:
             "recursive_convert": bool(self.audio_recursive.get()),
             "recursive_subtitle": bool(self.subtitle_recursive.get()),
             "recursive_dedup": bool(self.dedup_recursive.get()),
+            "dedup_name_only": bool(self.dedup_name_only.get()),
             "delete_originals_after_convert": bool(self.delete_original.get()),
         })
         save_config(self.cfg)
@@ -1077,8 +1119,9 @@ class App:
         parent = group[0].parent
         Label(
             win, justify=LEFT, anchor=W, wraplength=720,
-            text=(f"다음 위치에서 내용이 겹치는 폴더가 있지만 자동 판단이 어렵습니다.\n{parent}\n\n"
-                  "삭제할 폴더를 선택하세요. (아무것도 선택하지 않으면 건너뜁니다)"),
+            text=(f"다음 위치에서 중복일 수 있는 폴더입니다 (자동 판단 불가).\n{parent}\n\n"
+                  "파일 개수를 참고해 삭제할 폴더를 선택하세요. "
+                  "(아무것도 선택하지 않으면 건너뜁니다)"),
         ).pack(fill=X, padx=12, pady=(12, 6))
 
         picks: list[tuple[BooleanVar, Path]] = []
@@ -1122,13 +1165,17 @@ class App:
         self._save_settings()
         self._run_threaded(
             "중복 폴더 정리",
-            lambda: self._dedup_task(Path(path), bool(self.dedup_recursive.get())),
+            lambda: self._dedup_task(
+                Path(path),
+                bool(self.dedup_recursive.get()),
+                bool(self.dedup_name_only.get()),
+            ),
         )
 
-    def _dedup_task(self, root: Path, recursive: bool) -> None:
+    def _dedup_task(self, root: Path, recursive: bool, name_only: bool = True) -> None:
         log, progress = self._log, self._set_progress
         log("[중복 정리] 폴더 내용을 비교하는 중...")
-        auto, ambiguous = scan_duplicate_folders(root, recursive)
+        auto, ambiguous = scan_duplicate_folders(root, recursive, name_only)
 
         if not auto and not ambiguous:
             log("[중복 정리] 중복으로 판단되는 폴더가 없습니다.")
