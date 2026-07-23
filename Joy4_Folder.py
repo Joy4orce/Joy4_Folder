@@ -17,8 +17,8 @@ import urllib.request
 from pathlib import Path
 from tkinter import (
     BOTH, END, LEFT, RIGHT, X, Y, W, E,
-    Button, Checkbutton, Entry, Frame, IntVar, Label,
-    Radiobutton, Scrollbar, StringVar, Text, Tk, filedialog, messagebox,
+    BooleanVar, Button, Checkbutton, Entry, Frame, IntVar, Label,
+    Radiobutton, Scrollbar, StringVar, Text, Tk, Toplevel, filedialog, messagebox,
 )
 from tkinter import ttk
 
@@ -36,6 +36,7 @@ DEFAULT_CONFIG = {
     "recursive_translate": False,
     "recursive_convert": False,
     "recursive_subtitle": False,
+    "recursive_dedup": True,
     # Translation engine: "claude" (CLI) | "gemma4" (local koboldcpp at OpenAI-compatible endpoint)
     "translate_engine": "claude",
     "gemma4_url": "http://localhost:5001/v1/chat/completions",
@@ -561,6 +562,174 @@ def fix_subtitle_names(root: Path, recursive: bool, conflict_mode: str,
     log(f"[자막 완료] 이름변경 {renamed}개 / 건너뛰기 {skipped}개 / 실패 {failed}개")
 
 
+# ---------- feature 5: remove duplicate variant folders ----------
+
+# Two sibling folders count as duplicates when this fraction of the smaller
+# folder's file stems also appear in the other.
+DUP_OVERLAP_THRESHOLD = 0.5
+# A folder whose name contains a "negative" marker is the throwaway variant and
+# is deleted when a non-negative sibling duplicate exists. Positives are listed
+# for reference / future tie-breaks. 無/有 are the Chinese "없을 무 / 있을 유".
+DUP_NEGATIVE_MARKERS = ("없음", "없는", "제거", "미포함", "無", "なし", "ナシ")
+DUP_POSITIVE_MARKERS = ("있음", "있는", "포함", "포함된", "수록", "収録", "有", "あり", "アリ")
+
+
+def folder_file_stems(folder: Path) -> set[str]:
+    """All file stems (name without extension), lowercased, found recursively."""
+    stems: set[str] = set()
+    for _cur, _subs, files in os.walk(folder):
+        for f in files:
+            stems.add(Path(f).stem.lower())
+    return stems
+
+
+def _overlap_ratio(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
+
+
+def cluster_duplicate_folders(subs: list[Path], stems: dict[Path, set[str]]) -> list[list[Path]]:
+    """Group sibling folders whose contents overlap into duplicate clusters."""
+    parent = {s: s for s in subs}
+
+    def find(x: Path) -> Path:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(len(subs)):
+        for j in range(i + 1, len(subs)):
+            if _overlap_ratio(stems[subs[i]], stems[subs[j]]) >= DUP_OVERLAP_THRESHOLD:
+                parent[find(subs[i])] = find(subs[j])
+
+    clusters: dict[Path, list[Path]] = {}
+    for s in subs:
+        clusters.setdefault(find(s), []).append(s)
+    return [c for c in clusters.values() if len(c) >= 2]
+
+
+def decide_group_victims(names: list[str]) -> tuple[list[str], str]:
+    """Given the folder names of one duplicate cluster, return
+    (names_to_delete, reason). Empty list => cannot decide (ask the user)."""
+    negatives = [n for n in names if any(m in n for m in DUP_NEGATIVE_MARKERS)]
+    non_negative = [n for n in names if n not in negatives]
+    if negatives and non_negative:
+        return negatives, "'없음/제거' 계열 삭제 (있음/포함 우선)"
+
+    low = {n: n.lower() for n in names}
+    wavs = [n for n in names if "wav" in low[n] and "mp3" not in low[n]]
+    mp3s = [n for n in names if "mp3" in low[n]]
+    if wavs and mp3s:
+        return wavs, "wav 삭제 (mp3 우선)"
+
+    return [], ""
+
+
+def scan_duplicate_folders(root: Path, recursive: bool) -> tuple[list, list]:
+    """Walk the tree and classify duplicate sibling folders.
+
+    Returns (auto, ambiguous):
+      auto      = [(victim: Path, keeper_name: str, reason: str)] decided by rules
+      ambiguous = [cluster: list[Path]] duplicates a rule could not resolve
+    Only folders with overlapping contents are ever considered.
+    """
+    auto: list[tuple[Path, str, str]] = []
+    ambiguous: list[list[Path]] = []
+
+    if recursive:
+        parents = [Path(cur) for cur, _s, _f in os.walk(root)]
+    else:
+        parents = [root]
+
+    for parent_dir in parents:
+        try:
+            subs = [p for p in parent_dir.iterdir() if p.is_dir()]
+        except OSError:
+            continue
+        if len(subs) < 2:
+            continue
+        stems = {s: folder_file_stems(s) for s in subs}
+        subs = [s for s in subs if stems[s]]  # ignore empty folders
+        if len(subs) < 2:
+            continue
+
+        for cluster in cluster_duplicate_folders(subs, stems):
+            names = [c.name for c in cluster]
+            victim_names, reason = decide_group_victims(names)
+            victims = [c for c in cluster if c.name in victim_names]
+            keepers = [c for c in cluster if c not in victims]
+            for v in victims:
+                keeper_name = keepers[0].name if keepers else "(없음)"
+                auto.append((v, keeper_name, reason))
+            # Duplicates left undecided among the keepers still need a human.
+            if len(keepers) >= 2:
+                ambiguous.append(keepers)
+
+    return auto, ambiguous
+
+
+def _is_within(child: Path, parent: Path) -> bool:
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def dedupe_victim_paths(victims: list[Path]) -> list[Path]:
+    """Drop repeats and any victim already contained in another victim."""
+    uniq: list[Path] = []
+    seen: set[str] = set()
+    for v in victims:
+        key = str(v).lower()
+        if key not in seen:
+            seen.add(key)
+            uniq.append(v)
+    return [v for v in uniq if not any(o != v and _is_within(v, o) for o in uniq)]
+
+
+def send_to_recycle_bin(path: Path) -> tuple[bool, str]:
+    """Move a file/folder to the Recycle Bin (recoverable). Windows only."""
+    if not IS_WINDOWS:
+        return False, "휴지통 이동은 Windows에서만 지원됩니다"
+    import ctypes
+    from ctypes import wintypes
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", wintypes.HWND),
+            ("wFunc", wintypes.UINT),
+            ("pFrom", wintypes.LPCWSTR),
+            ("pTo", wintypes.LPCWSTR),
+            ("fFlags", ctypes.c_uint16),
+            ("fAnyOperationsAborted", wintypes.BOOL),
+            ("hNameMappings", ctypes.c_void_p),
+            ("lpszProgressTitle", wintypes.LPCWSTR),
+        ]
+
+    FO_DELETE = 3
+    FOF_ALLOWUNDO = 0x0040
+    FOF_NOCONFIRMATION = 0x0010
+    FOF_SILENT = 0x0004
+    FOF_NOERRORUI = 0x0400
+
+    op = SHFILEOPSTRUCTW()
+    op.wFunc = FO_DELETE
+    op.pFrom = str(path) + "\x00\x00"  # double-null terminated list
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+    try:
+        res = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    except Exception as e:  # pragma: no cover - platform specific
+        return False, f"SHFileOperation 호출 실패: {e}"
+    if res != 0:
+        return False, f"SHFileOperation 오류 코드 {res}"
+    if op.fAnyOperationsAborted:
+        return False, "작업이 중단됨"
+    return True, ""
+
+
 # ---------- GUI ----------
 
 class App:
@@ -697,6 +866,27 @@ class App:
             command=self._save_settings,
         ).pack(side=LEFT)
 
+        # --- feature 5 ---
+        f5 = ttk.LabelFrame(outer, text="5. 중복 폴더 정리 (휴지통으로 이동)")
+        f5.pack(fill=X, pady=4)
+        self.dedup_path = StringVar()
+        row5 = Frame(f5)
+        row5.pack(fill=X, padx=6, pady=6)
+        Entry(row5, textvariable=self.dedup_path).pack(side=LEFT, fill=X, expand=True)
+        Button(row5, text="폴더 선택", command=lambda: self._pick(self.dedup_path)).pack(side=LEFT, padx=4)
+        Button(row5, text="실행", command=self._run_dedup, width=8).pack(side=LEFT)
+        opts5 = Frame(f5)
+        opts5.pack(fill=X, padx=6, pady=(0, 6))
+        self.dedup_recursive = IntVar(value=int(self.cfg["recursive_dedup"]))
+        Checkbutton(
+            opts5, text="하위 폴더까지 탐색", variable=self.dedup_recursive,
+            command=self._save_settings,
+        ).pack(side=LEFT)
+        Label(
+            opts5, text="mp3>wav · '있음/포함' 우선, '없음/제거' 삭제 · 판단 불가 시 직접 선택",
+            fg="#777",
+        ).pack(side=LEFT, padx=(16, 0))
+
         # --- log ---
         logframe = ttk.LabelFrame(outer, text="로그")
         logframe.pack(fill=BOTH, expand=True, pady=(8, 0))
@@ -754,6 +944,7 @@ class App:
             "recursive_translate": bool(self.translate_recursive.get()),
             "recursive_convert": bool(self.audio_recursive.get()),
             "recursive_subtitle": bool(self.subtitle_recursive.get()),
+            "recursive_dedup": bool(self.dedup_recursive.get()),
             "delete_originals_after_convert": bool(self.delete_original.get()),
         })
         save_config(self.cfg)
@@ -852,6 +1043,139 @@ class App:
             self._log,
             self._set_progress,
         ))
+
+    # --- feature 5: duplicate folder cleanup ---
+
+    def _call_on_main(self, fn):
+        """Run fn() on the Tk main thread and block the worker until it returns."""
+        box: dict = {}
+        done = threading.Event()
+
+        def wrapper():
+            try:
+                box["value"] = fn()
+            except Exception as e:  # surface to worker
+                box["error"] = e
+            finally:
+                done.set()
+
+        self.root.after(0, wrapper)
+        done.wait()
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
+
+    def _ask_duplicate_choice(self, group: list[Path]) -> list[Path]:
+        """Modal chooser for an ambiguous duplicate group. Returns folders to
+        delete (possibly empty = skip). Must run on the main thread."""
+        win = Toplevel(self.root)
+        win.title("중복 폴더 확인")
+        win.transient(self.root)
+        win.grab_set()
+        win.geometry("760x360")
+
+        parent = group[0].parent
+        Label(
+            win, justify=LEFT, anchor=W, wraplength=720,
+            text=(f"다음 위치에서 내용이 겹치는 폴더가 있지만 자동 판단이 어렵습니다.\n{parent}\n\n"
+                  "삭제할 폴더를 선택하세요. (아무것도 선택하지 않으면 건너뜁니다)"),
+        ).pack(fill=X, padx=12, pady=(12, 6))
+
+        picks: list[tuple[BooleanVar, Path]] = []
+        listbox = Frame(win)
+        listbox.pack(fill=BOTH, expand=True, padx=12)
+        for folder in group:
+            count = sum(len(files) for _c, _s, files in os.walk(folder))
+            bv = BooleanVar(value=False)
+            Checkbutton(
+                listbox, variable=bv, anchor=W, justify=LEFT, wraplength=700,
+                text=f"[파일 {count}개]  {folder.name}",
+            ).pack(fill=X, anchor=W)
+            picks.append((bv, folder))
+
+        result: dict = {"picked": []}
+
+        def do_delete():
+            result["picked"] = [f for bv, f in picks if bv.get()]
+            win.destroy()
+
+        def do_skip():
+            result["picked"] = []
+            win.destroy()
+
+        btns = Frame(win)
+        btns.pack(fill=X, padx=12, pady=10)
+        Button(btns, text="선택한 폴더 삭제", command=do_delete).pack(side=RIGHT, padx=(6, 0))
+        Button(btns, text="건너뛰기", command=do_skip).pack(side=RIGHT)
+        win.protocol("WM_DELETE_WINDOW", do_skip)
+        win.wait_window()
+        return result["picked"]
+
+    def _run_dedup(self) -> None:
+        path = self.dedup_path.get().strip()
+        if not path:
+            messagebox.showwarning("경고", "폴더를 선택하세요.")
+            return
+        if not Path(path).is_dir():
+            messagebox.showerror("오류", "유효한 폴더가 아닙니다.")
+            return
+        self._save_settings()
+        self._run_threaded(
+            "중복 폴더 정리",
+            lambda: self._dedup_task(Path(path), bool(self.dedup_recursive.get())),
+        )
+
+    def _dedup_task(self, root: Path, recursive: bool) -> None:
+        log, progress = self._log, self._set_progress
+        log("[중복 정리] 폴더 내용을 비교하는 중...")
+        auto, ambiguous = scan_duplicate_folders(root, recursive)
+
+        if not auto and not ambiguous:
+            log("[중복 정리] 중복으로 판단되는 폴더가 없습니다.")
+            return
+
+        for victim, keeper, reason in auto:
+            log(f"  [자동] 삭제 예정: {victim.name}  (유지: {keeper} · {reason})")
+
+        chosen: list[Path] = []
+        if ambiguous:
+            log(f"[중복 정리] 자동 판단이 어려운 중복 {len(ambiguous)}건 → 직접 선택 창을 엽니다.")
+        for group in ambiguous:
+            picked = self._call_on_main(lambda g=group: self._ask_duplicate_choice(g))
+            for p in picked:
+                log(f"  [선택] 삭제 예정: {p.name}")
+            chosen.extend(picked)
+
+        victims = dedupe_victim_paths([v for v, _k, _r in auto] + chosen)
+        if not victims:
+            log("[중복 정리] 삭제할 폴더가 없습니다.")
+            return
+
+        confirmed = self._call_on_main(lambda: messagebox.askyesno(
+            "삭제 확인",
+            f"폴더 {len(victims)}개를 휴지통으로 이동합니다.\n"
+            "(휴지통에서 복구할 수 있습니다.)\n\n계속할까요?",
+        ))
+        if not confirmed:
+            log("[중복 정리] 취소되었습니다.")
+            return
+
+        progress(0, len(victims), "삭제 중")
+        deleted = failed = 0
+        for idx, victim in enumerate(victims):
+            if not victim.exists():
+                progress(idx + 1, len(victims), "삭제 중")
+                continue
+            ok, err = send_to_recycle_bin(victim)
+            if ok:
+                log(f"  휴지통으로 이동: {victim}")
+                deleted += 1
+            else:
+                log(f"  [삭제 실패] {victim}: {err}")
+                failed += 1
+            progress(idx + 1, len(victims), "삭제 중")
+
+        log(f"[중복 정리 완료] 휴지통 이동 {deleted}개 / 실패 {failed}개")
 
 
 def main() -> None:
