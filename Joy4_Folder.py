@@ -646,24 +646,39 @@ def decide_group_victims(names: list[str],
     return [], ""
 
 
-def name_variant_group(subs: list[Path],
+def name_variant_group(subs: list[Path], stems: dict[Path, set[str]],
                        keep_markers: tuple = DUP_POSITIVE_MARKERS,
                        delete_markers: tuple = DUP_NEGATIVE_MARKERS) -> list[Path]:
     """Sibling folders whose NAMES look like a keep/delete variant pair, used
-    when their contents do NOT overlap (so auto-delete is unsafe and we ask
-    instead). Requires markers on both sides so unrelated folders aren't
-    flagged. Returns the marker-bearing folders, or [] if there's no clear pair.
+    when their contents partially overlap (too little for confident auto-delete).
+
+    A delete-marked folder is only included when it shares at least one file
+    with a keep side — if nothing overlaps, its files aren't duplicated anywhere
+    and it must not be offered for deletion. Requires markers on both sides so
+    unrelated folders aren't flagged. Returns [] if there's no such pair.
     """
+    def pair_group(losers: list[Path], keepers: list[Path]) -> list[Path]:
+        rel_losers = [x for x in losers if any(stems[x] & stems[k] for k in keepers)]
+        if not rel_losers:
+            return []
+        rel_keepers = [k for k in keepers if any(stems[k] & stems[x] for x in rel_losers)]
+        chosen = set(rel_losers) | set(rel_keepers)
+        return [s for s in subs if s in chosen]
+
     neg = [s for s in subs if any(m in s.name for m in delete_markers)]
     pos = [s for s in subs if any(m in s.name for m in keep_markers)]
     if neg and pos:
-        return [s for s in subs if s in neg or s in pos]
+        group = pair_group(neg, pos)
+        if group:
+            return group
 
     low = {s: s.name.lower() for s in subs}
     wavs = [s for s in subs if "wav" in low[s] and "mp3" not in low[s]]
     mp3s = [s for s in subs if "mp3" in low[s]]
     if wavs and mp3s:
-        return mp3s + wavs
+        group = pair_group(wavs, mp3s)
+        if group:
+            return group
 
     return []
 
@@ -710,17 +725,21 @@ def scan_duplicate_folders(root: Path, recursive: bool,
             victims = [c for c in cluster if c.name in victim_names]
             keepers = [c for c in cluster if c not in victims]
             for v in victims:
-                keeper_name = keepers[0].name if keepers else "(없음)"
-                auto.append((v, keeper_name, reason))
+                # Only auto-delete when the victim's files actually exist in a
+                # keeper, so nothing unique is lost.
+                overlapping = [k for k in keepers if stems[v] & stems[k]]
+                if overlapping:
+                    auto.append((v, overlapping[0].name, reason))
             # Duplicates left undecided among the keepers still need a human.
             if len(keepers) >= 2:
                 ambiguous.append(keepers)
             handled.update(cluster)
 
-        # Name-paired siblings whose contents differ: ask, don't auto-delete.
+        # Name-paired siblings whose contents partially overlap: ask, don't
+        # auto-delete. Folders sharing no files with a keeper are skipped.
         if include_name_only:
             remaining = [s for s in subs if s not in handled]
-            nv = name_variant_group(remaining, keep_markers, delete_markers)
+            nv = name_variant_group(remaining, stems, keep_markers, delete_markers)
             if len(nv) >= 2:
                 ambiguous.append(nv)
 
