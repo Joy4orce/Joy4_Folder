@@ -39,6 +39,10 @@ DEFAULT_CONFIG = {
     "recursive_dedup": True,
     # In dedup, also pop up name-paired siblings whose contents differ.
     "dedup_name_only": True,
+    # User-defined dedup rules: folder-name substrings to keep / delete.
+    # These are added to the built-in markers (있음/없음 등).
+    "dedup_keep_markers": [],
+    "dedup_delete_markers": [],
     # Translation engine: "claude" (CLI) | "gemma4" (local koboldcpp at OpenAI-compatible endpoint)
     "translate_engine": "claude",
     "gemma4_url": "http://localhost:5001/v1/chat/completions",
@@ -612,13 +616,26 @@ def cluster_duplicate_folders(subs: list[Path], stems: dict[Path, set[str]]) -> 
     return [c for c in clusters.values() if len(c) >= 2]
 
 
-def decide_group_victims(names: list[str]) -> tuple[list[str], str]:
+def parse_marker_list(text: str) -> list[str]:
+    """Split a user-entered, comma-separated marker string into a clean list."""
+    return [t.strip() for t in text.split(",") if t.strip()]
+
+
+def decide_group_victims(names: list[str],
+                         keep_markers: tuple = DUP_POSITIVE_MARKERS,
+                         delete_markers: tuple = DUP_NEGATIVE_MARKERS) -> tuple[list[str], str]:
     """Given the folder names of one duplicate cluster, return
-    (names_to_delete, reason). Empty list => cannot decide (ask the user)."""
-    negatives = [n for n in names if any(m in n for m in DUP_NEGATIVE_MARKERS)]
+    (names_to_delete, reason). Empty list => cannot decide (ask the user).
+
+    A folder matching a keep marker is never a victim, even if it also matches
+    a delete marker, so a user 'keep' rule always wins."""
+    negatives = [
+        n for n in names
+        if any(m in n for m in delete_markers) and not any(k in n for k in keep_markers)
+    ]
     non_negative = [n for n in names if n not in negatives]
     if negatives and non_negative:
-        return negatives, "'없음/제거' 계열 삭제 (있음/포함 우선)"
+        return negatives, "'없음/제거/삭제 규칙' 쪽 삭제 (있음/포함/남길 규칙 우선)"
 
     low = {n: n.lower() for n in names}
     wavs = [n for n in names if "wav" in low[n] and "mp3" not in low[n]]
@@ -629,14 +646,16 @@ def decide_group_victims(names: list[str]) -> tuple[list[str], str]:
     return [], ""
 
 
-def name_variant_group(subs: list[Path]) -> list[Path]:
+def name_variant_group(subs: list[Path],
+                       keep_markers: tuple = DUP_POSITIVE_MARKERS,
+                       delete_markers: tuple = DUP_NEGATIVE_MARKERS) -> list[Path]:
     """Sibling folders whose NAMES look like a keep/delete variant pair, used
     when their contents do NOT overlap (so auto-delete is unsafe and we ask
     instead). Requires markers on both sides so unrelated folders aren't
     flagged. Returns the marker-bearing folders, or [] if there's no clear pair.
     """
-    neg = [s for s in subs if any(m in s.name for m in DUP_NEGATIVE_MARKERS)]
-    pos = [s for s in subs if any(m in s.name for m in DUP_POSITIVE_MARKERS)]
+    neg = [s for s in subs if any(m in s.name for m in delete_markers)]
+    pos = [s for s in subs if any(m in s.name for m in keep_markers)]
     if neg and pos:
         return [s for s in subs if s in neg or s in pos]
 
@@ -650,7 +669,9 @@ def name_variant_group(subs: list[Path]) -> list[Path]:
 
 
 def scan_duplicate_folders(root: Path, recursive: bool,
-                           include_name_only: bool = True) -> tuple[list, list]:
+                           include_name_only: bool = True,
+                           keep_markers: tuple = DUP_POSITIVE_MARKERS,
+                           delete_markers: tuple = DUP_NEGATIVE_MARKERS) -> tuple[list, list]:
     """Walk the tree and classify duplicate sibling folders.
 
     Returns (auto, ambiguous):
@@ -685,7 +706,7 @@ def scan_duplicate_folders(root: Path, recursive: bool,
         handled: set[Path] = set()
         for cluster in cluster_duplicate_folders(subs, stems):
             names = [c.name for c in cluster]
-            victim_names, reason = decide_group_victims(names)
+            victim_names, reason = decide_group_victims(names, keep_markers, delete_markers)
             victims = [c for c in cluster if c.name in victim_names]
             keepers = [c for c in cluster if c not in victims]
             for v in victims:
@@ -699,7 +720,7 @@ def scan_duplicate_folders(root: Path, recursive: bool,
         # Name-paired siblings whose contents differ: ask, don't auto-delete.
         if include_name_only:
             remaining = [s for s in subs if s not in handled]
-            nv = name_variant_group(remaining)
+            nv = name_variant_group(remaining, keep_markers, delete_markers)
             if len(nv) >= 2:
                 ambiguous.append(nv)
 
@@ -777,8 +798,8 @@ class App:
 
     def _build_ui(self) -> None:
         self.root.title("Joy4_Folder")
-        self.root.geometry("860x980")
-        self.root.minsize(700, 820)
+        self.root.geometry("860x1060")
+        self.root.minsize(700, 860)
 
         outer = Frame(self.root, padx=10, pady=10)
         outer.pack(fill=BOTH, expand=True)
@@ -923,9 +944,28 @@ class App:
             opts5, text="내용이 달라도 이름이 짝이면 확인", variable=self.dedup_name_only,
             command=self._save_settings,
         ).pack(side=LEFT, padx=(16, 0))
+
+        # user-defined keep/delete rules (added to built-in 있음/없음 markers)
+        rules5 = Frame(f5)
+        rules5.pack(fill=X, padx=6, pady=(0, 4))
+        Label(rules5, text="남길 폴더 이름:").grid(row=0, column=0, sticky=W, pady=2)
+        self.dedup_keep_var = StringVar(value=", ".join(self.cfg.get("dedup_keep_markers", [])))
+        ek = Entry(rules5, textvariable=self.dedup_keep_var)
+        ek.grid(row=0, column=1, sticky=W + E, padx=6)
+        ek.bind("<FocusOut>", lambda _e: self._save_settings())
+        Label(rules5, text="삭제할 폴더 이름:").grid(row=1, column=0, sticky=W, pady=2)
+        self.dedup_del_var = StringVar(value=", ".join(self.cfg.get("dedup_delete_markers", [])))
+        ed = Entry(rules5, textvariable=self.dedup_del_var)
+        ed.grid(row=1, column=1, sticky=W + E, padx=6)
+        ed.bind("<FocusOut>", lambda _e: self._save_settings())
+        rules5.columnconfigure(1, weight=1)
+
         Label(
-            f5, text="mp3>wav · '있음/포함' 우선, '없음/제거' 삭제 · 판단 불가 시 직접 선택",
-            fg="#777",
+            f5, fg="#777",
+            text=("mp3>wav · '있음/포함' 우선, '없음/제거' 삭제 · 판단 불가 시 직접 선택\n"
+                  "위 칸에 폴더 이름에 포함될 문자열을 쉼표로 구분해 적으면 규칙에 추가됩니다 "
+                  "(예: 삭제할 폴더 이름 = 통상판, 미포함). '남길 폴더'는 삭제되지 않습니다."),
+            justify=LEFT,
         ).pack(fill=X, padx=6, pady=(0, 6), anchor=W)
 
         # --- log ---
@@ -987,6 +1027,8 @@ class App:
             "recursive_subtitle": bool(self.subtitle_recursive.get()),
             "recursive_dedup": bool(self.dedup_recursive.get()),
             "dedup_name_only": bool(self.dedup_name_only.get()),
+            "dedup_keep_markers": parse_marker_list(self.dedup_keep_var.get()),
+            "dedup_delete_markers": parse_marker_list(self.dedup_del_var.get()),
             "delete_originals_after_convert": bool(self.delete_original.get()),
         })
         save_config(self.cfg)
@@ -1166,19 +1208,26 @@ class App:
             messagebox.showerror("오류", "유효한 폴더가 아닙니다.")
             return
         self._save_settings()
+        keep_markers = DUP_POSITIVE_MARKERS + tuple(parse_marker_list(self.dedup_keep_var.get()))
+        delete_markers = DUP_NEGATIVE_MARKERS + tuple(parse_marker_list(self.dedup_del_var.get()))
         self._run_threaded(
             "중복 폴더 정리",
             lambda: self._dedup_task(
                 Path(path),
                 bool(self.dedup_recursive.get()),
                 bool(self.dedup_name_only.get()),
+                keep_markers,
+                delete_markers,
             ),
         )
 
-    def _dedup_task(self, root: Path, recursive: bool, name_only: bool = True) -> None:
+    def _dedup_task(self, root: Path, recursive: bool, name_only: bool = True,
+                    keep_markers: tuple = DUP_POSITIVE_MARKERS,
+                    delete_markers: tuple = DUP_NEGATIVE_MARKERS) -> None:
         log, progress = self._log, self._set_progress
         log("[중복 정리] 폴더 내용을 비교하는 중...")
-        auto, ambiguous = scan_duplicate_folders(root, recursive, name_only)
+        auto, ambiguous = scan_duplicate_folders(
+            root, recursive, name_only, keep_markers, delete_markers)
 
         if not auto and not ambiguous:
             log("[중복 정리] 중복으로 판단되는 폴더가 없습니다.")

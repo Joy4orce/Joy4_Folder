@@ -9,6 +9,8 @@
   "recursive_subtitle": false,
   "recursive_dedup": true,
   "dedup_name_only": true,
+  "dedup_keep_markers": [],
+  "dedup_delete_markers": [],
   "translate_engine": "claude",
   "gemma4_url": "http://localhost:5001/v1/chat/completions",
   "gemma4_temperature": 0.1,
