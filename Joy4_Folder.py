@@ -1107,11 +1107,14 @@ class App:
             raise box["error"]
         return box.get("value")
 
-    def _ask_duplicate_choice(self, group: list[Path]) -> list[Path]:
+    def _ask_duplicate_choice(self, group: list[Path],
+                              index: int = 1, total: int = 1) -> list[Path]:
         """Modal chooser for an ambiguous duplicate group. Returns folders to
-        delete (possibly empty = skip). Must run on the main thread."""
+        delete (possibly empty = skip). Must run on the main thread.
+        index/total show progress across all pending popups, e.g. (5/17)."""
+        counter = f"({index}/{total})"
         win = Toplevel(self.root)
-        win.title("중복 폴더 확인")
+        win.title(f"중복 폴더 확인 {counter}")
         win.transient(self.root)
         win.grab_set()
         win.geometry("760x360")
@@ -1119,7 +1122,7 @@ class App:
         parent = group[0].parent
         Label(
             win, justify=LEFT, anchor=W, wraplength=720,
-            text=(f"다음 위치에서 중복일 수 있는 폴더입니다 (자동 판단 불가).\n{parent}\n\n"
+            text=(f"[{counter}] 다음 위치에서 중복일 수 있는 폴더입니다 (자동 판단 불가).\n{parent}\n\n"
                   "파일 개수를 참고해 삭제할 폴더를 선택하세요. "
                   "(아무것도 선택하지 않으면 건너뜁니다)"),
         ).pack(fill=X, padx=12, pady=(12, 6))
@@ -1185,10 +1188,13 @@ class App:
             log(f"  [자동] 삭제 예정: {victim.name}  (유지: {keeper} · {reason})")
 
         chosen: list[Path] = []
+        total_amb = len(ambiguous)
         if ambiguous:
-            log(f"[중복 정리] 자동 판단이 어려운 중복 {len(ambiguous)}건 → 직접 선택 창을 엽니다.")
-        for group in ambiguous:
-            picked = self._call_on_main(lambda g=group: self._ask_duplicate_choice(g))
+            log(f"[중복 정리] 자동 판단이 어려운 중복 {total_amb}건 → 직접 선택 창을 엽니다.")
+        for i, group in enumerate(ambiguous, start=1):
+            picked = self._call_on_main(
+                lambda g=group, idx=i: self._ask_duplicate_choice(g, idx, total_amb)
+            )
             for p in picked:
                 log(f"  [선택] 삭제 예정: {p.name}")
             chosen.extend(picked)
