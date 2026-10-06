@@ -355,6 +355,69 @@ def translate_names(keys: list[str], cfg: dict, log, progress) -> dict[str, str]
     return result
 
 
+# Square-bracket groups ([...] / full-width ［...］) usually hold the circle
+# name and must be kept verbatim. They are split out before translation and
+# re-inserted afterwards, so the engine never sees them.
+BRACKET_SPLIT_RE = re.compile(r"(\[[^\[\]]*\]|［[^［］]*］)")
+WS_EDGES_RE = re.compile(r"^(\s*)(.*?)(\s*)$", re.S)
+
+
+def _segments(name: str) -> list[tuple[str, bool]]:
+    """Split a name into (text, is_bracket) pieces, in order. Because the regex
+    has one capturing group, odd-indexed pieces from re.split are the brackets."""
+    return [(p, i % 2 == 1) for i, p in enumerate(BRACKET_SPLIT_RE.split(name))]
+
+
+def has_translatable_japanese(name: str) -> bool:
+    """True if there is Japanese OUTSIDE any [...] group — i.e. something to
+    translate. A name whose only Japanese is a bracketed circle name is skipped."""
+    return any(
+        not is_br and has_japanese(WS_EDGES_RE.match(text).group(2))
+        for text, is_br in _segments(name)
+    )
+
+
+def translate_name_map(keys: list[str], cfg: dict, log, progress) -> dict[str, str]:
+    """Translate keys while leaving [...] groups untouched.
+
+    Only the non-bracket text fragments that contain Japanese are sent to the
+    engine (deduplicated across all keys). Each key is then rebuilt in its
+    original order: brackets verbatim, translated fragments in place, and the
+    whitespace around each fragment preserved. Keys with nothing to translate,
+    or whose fragments all failed, are omitted so they are left unrenamed."""
+    cores: list[str] = []
+    for key in keys:
+        for text, is_br in _segments(key):
+            if is_br:
+                continue
+            core = WS_EDGES_RE.match(text).group(2)
+            if core and has_japanese(core):
+                cores.append(core)
+    unique_cores = list(dict.fromkeys(cores))
+    if not unique_cores:
+        return {}
+    frag_map = translate_names(unique_cores, cfg, log, progress)
+
+    result: dict[str, str] = {}
+    for key in keys:
+        pieces: list[str] = []
+        changed = False
+        for text, is_br in _segments(key):
+            if is_br:
+                pieces.append(text)
+                continue
+            lead, core, trail = WS_EDGES_RE.match(text).groups()
+            translated = frag_map.get(core) if core and has_japanese(core) else None
+            if translated:
+                pieces.append(lead + translated + trail)
+                changed = True
+            else:
+                pieces.append(text)
+        if changed:
+            result[key] = "".join(pieces)
+    return result
+
+
 def _translate_key(p: Path) -> tuple[str, bool]:
     """Return (translation_key, is_stem).
     - Files where the stem has Japanese → translate only the stem; suffix is reattached after.
@@ -377,26 +440,27 @@ def translate_folder(root: Path, recursive: bool, conflict_mode: str,
         for cur, _subs, files in os.walk(root, topdown=False):
             curp = Path(cur)
             for f in files:
-                if has_japanese(f):
+                if has_translatable_japanese(f):
                     items.append(curp / f)
-            if curp != root and has_japanese(curp.name):
+            if curp != root and has_translatable_japanese(curp.name):
                 items.append(curp)
     else:
         for entry in root.iterdir():
-            if has_japanese(entry.name):
+            if has_translatable_japanese(entry.name):
                 items.append(entry)
 
     if not items:
-        log("[번역] 일본어 이름이 포함된 항목이 없습니다.")
+        log("[번역] 일본어 이름이 포함된 항목이 없습니다. ([ ] 안의 서클 이름은 번역 대상이 아닙니다)")
         return
 
     engine = cfg.get("translate_engine", "claude")
     log(f"[번역] {len(items)}개 항목 발견. (엔진: {engine})")
 
     # Dedup by translation key (stem for files w/ JP stem; full name otherwise).
+    # [...] groups (circle names) are kept verbatim; only the rest is translated.
     keys = [_translate_key(p)[0] for p in items]
     unique = list(dict.fromkeys(keys))
-    name_map = translate_names(unique, cfg, log, progress)
+    name_map = translate_name_map(unique, cfg, log, progress)
 
     if not name_map:
         log("[번역 실패] 처리할 결과가 없습니다.")
