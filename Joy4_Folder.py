@@ -637,8 +637,10 @@ def fix_subtitle_names(root: Path, recursive: bool, conflict_mode: str,
 
 # ---------- feature 5: remove duplicate variant folders ----------
 
-# Two sibling folders count as duplicates when this fraction of the smaller
-# folder's file stems also appear in the other.
+# Two sibling folders count as duplicates when at least this fraction of all
+# the file stems across both appear in both (Jaccard). Measured against the
+# union, not the smaller folder, so a collection folder that merely contains
+# one small folder's files among thousands of others is not its duplicate.
 DUP_OVERLAP_THRESHOLD = 0.5
 # A folder whose name contains a "negative" marker is the throwaway variant and
 # is deleted when a non-negative sibling duplicate exists. Positives are listed
@@ -659,7 +661,7 @@ def folder_file_stems(folder: Path) -> set[str]:
 def _overlap_ratio(a: set[str], b: set[str]) -> float:
     if not a or not b:
         return 0.0
-    return len(a & b) / min(len(a), len(b))
+    return len(a & b) / len(a | b)
 
 
 # DLsite product code (RJ + 6–8 digits, e.g. RJ123456 / RJ01234567). Two
@@ -847,9 +849,10 @@ def scan_duplicate_folders(root: Path, recursive: bool,
 
 
 def _shared_code(cluster: list[Path]) -> str | None:
-    """The one DLsite code all coded members of a cluster share, if any."""
-    codes = {c for c in (dlsite_code(p.name) for p in cluster) if c}
-    return next(iter(codes)) if len(codes) == 1 else None
+    """The one DLsite code EVERY member of a cluster carries, if any. A member
+    without a code means the cluster was not formed by code, so None."""
+    codes = {dlsite_code(p.name) for p in cluster}
+    return next(iter(codes)) if len(codes) == 1 and None not in codes else None
 
 
 def _classify_cluster(cluster: list[Path], stems: dict[Path, set[str]],
@@ -883,6 +886,28 @@ def _classify_cluster(cluster: list[Path], stems: dict[Path, set[str]],
     leftover = keepers + unsure
     if len(leftover) >= 2:
         ambiguous.append((leftover, why))
+
+
+def _group_file_stats(group: list[Path]) -> dict:
+    """For a duplicate group: per folder (total files, files also present in
+    another member, files only here), plus the stems present in 2+ members."""
+    stems = {f: folder_file_stems(f) for f in group}
+    per_folder: dict[Path, tuple[int, int, int]] = {}
+    for f in group:
+        others: set[str] = set().union(*(stems[o] for o in group if o is not f))
+        total = shared = 0
+        for _cur, _subs, files in os.walk(f):
+            for name in files:
+                total += 1
+                if Path(name).stem.lower() in others:
+                    shared += 1
+        per_folder[f] = (total, shared, total - shared)
+    seen: dict[str, int] = {}
+    for f in group:
+        for s in stems[f]:
+            seen[s] = seen.get(s, 0) + 1
+    common = sorted(s for s, n in seen.items() if n >= 2)
+    return {"per_folder": per_folder, "common": common}
 
 
 def _is_within(child: Path, parent: Path) -> bool:
@@ -1328,21 +1353,31 @@ class App:
             win, justify=LEFT, anchor=W, wraplength=720,
             text=(f"[{counter}] 다음 위치에서 중복일 수 있는 폴더입니다 (자동 판단 불가).\n{where}\n"
                   f"{why_line}\n"
-                  "파일 개수를 참고해 삭제할 폴더를 선택하세요. "
+                  "각 폴더의 파일이 다른 폴더에도 있는지(겹침) / 이 폴더에만 있는지(고유)를 보고 "
+                  "삭제할 폴더를 선택하세요. 고유 파일이 0개인 폴더는 지워도 잃는 것이 없습니다. "
                   "(아무것도 선택하지 않으면 건너뜁니다)"),
         ).pack(fill=X, padx=12, pady=(12, 6))
 
+        # What actually overlaps, per folder, so the choice is informed.
+        stats = _group_file_stats(group)
         picks: list[tuple[BooleanVar, Path]] = []
         listbox = Frame(win)
         listbox.pack(fill=BOTH, expand=True, padx=12)
         for folder in group:
-            count = sum(len(files) for _c, _s, files in os.walk(folder))
+            total, shared, unique = stats["per_folder"][folder]
+            hint = "   ← 고유 파일 없음 (지워도 손실 없음)" if unique == 0 else ""
             bv = BooleanVar(value=False)
             Checkbutton(
                 listbox, variable=bv, anchor=W, justify=LEFT, wraplength=700,
-                text=f"[파일 {count}개]  {folder.name if same_parent else folder}",
+                text=(f"[파일 {total}개 · 겹침 {shared} · 고유 {unique}]  "
+                      f"{folder.name if same_parent else folder}{hint}"),
             ).pack(fill=X, anchor=W)
             picks.append((bv, folder))
+        common = stats["common"]
+        if common:
+            sample = ", ".join(common[:5]) + (f" … 외 {len(common) - 5}개" if len(common) > 5 else "")
+            Label(listbox, justify=LEFT, anchor=W, wraplength=700, fg="#555",
+                  text=f"공통 파일 {len(common)}개 (예: {sample})").pack(fill=X, anchor=W, pady=(6, 0))
 
         result: dict = {"picked": []}
 
@@ -1360,10 +1395,15 @@ class App:
         def do_skip():
             close([])
 
+        def do_stop_all():
+            self._dup_stop_all = True
+            close([])
+
         btns = Frame(win)
         btns.pack(fill=X, padx=12, pady=10)
         Button(btns, text="선택한 폴더 삭제", command=do_delete).pack(side=RIGHT, padx=(6, 0))
         Button(btns, text="건너뛰기", command=do_skip).pack(side=RIGHT)
+        Button(btns, text="나머지 전부 건너뛰기", command=do_stop_all).pack(side=LEFT)
         win.protocol("WM_DELETE_WINDOW", do_skip)
         win.wait_window()
         return result["picked"]
@@ -1372,7 +1412,7 @@ class App:
         """Geometry for the duplicate-choice popup: the position the user last
         left it at if that still lands on screen, otherwise centred over the
         main window (never the top-left corner Tk defaults to)."""
-        default_w, default_h = 760, 380
+        default_w, default_h = 760, 440
         remembered = self.cfg.get("dedup_popup_geometry") or ""
         m = re.fullmatch(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", remembered)
         if m:
@@ -1427,7 +1467,11 @@ class App:
         total_amb = len(ambiguous)
         if ambiguous:
             log(f"[중복 정리] 자동 판단이 어려운 중복 {total_amb}건 → 직접 선택 창을 엽니다.")
+        self._dup_stop_all = False
         for i, (group, why) in enumerate(ambiguous, start=1):
+            if self._dup_stop_all:
+                log(f"  [중단] 남은 {total_amb - i + 1}건은 건너뜁니다.")
+                break
             picked = self._call_on_main(
                 lambda g=group, idx=i, w=why: self._ask_duplicate_choice(g, idx, total_amb, w)
             )
