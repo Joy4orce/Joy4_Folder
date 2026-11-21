@@ -67,6 +67,7 @@ copy config.example.json config.json
 | `dedup_name_only` | 내용이 달라도 이름이 짝이면 팝업으로 확인 | `true` |
 | `dedup_keep_markers` | 남길 폴더 이름 규칙(문자열 목록). 이 문자열이 든 폴더는 삭제하지 않음 | `[]` |
 | `dedup_delete_markers` | 삭제할 폴더 이름 규칙(문자열 목록). 이 문자열이 든 폴더를 삭제 후보로 | `[]` |
+| `dedup_popup_geometry` | 중복 확인 팝업을 마지막으로 닫은 위치·크기(`WxH+X+Y`). 팝업을 닫을 때 자동 저장되어 다음 팝업이 같은 자리에 열림. 비어 있으면 메인 창 가운데 | `""` |
 | `translate_engine` | 번역 엔진: `claude` / `gemma4` | `claude` |
 | `gemma4_url` | Gemma4(OpenAI 호환) 엔드포인트 | `http://localhost:5001/v1/chat/completions` |
 | `gemma4_temperature` | Gemma4 temperature | `0.1` |

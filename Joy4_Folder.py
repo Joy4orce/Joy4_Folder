@@ -43,6 +43,9 @@ DEFAULT_CONFIG = {
     # These are added to the built-in markers (있음/없음 등).
     "dedup_keep_markers": [],
     "dedup_delete_markers": [],
+    # Last position/size of the duplicate-choice popup ("WxH+X+Y"); set by
+    # the GUI when the popup is closed so the next one opens in the same spot.
+    "dedup_popup_geometry": "",
     # Translation engine: "claude" (CLI) | "gemma4" (local koboldcpp at OpenAI-compatible endpoint)
     "translate_engine": "claude",
     "gemma4_url": "http://localhost:5001/v1/chat/completions",
@@ -1316,7 +1319,7 @@ class App:
         win.title(f"중복 폴더 확인 {counter}")
         win.transient(self.root)
         win.grab_set()
-        win.geometry("760x380")
+        win.geometry(self._dup_popup_geometry())
 
         same_parent = len({f.parent for f in group}) == 1
         where = str(group[0].parent) if same_parent else "(서로 다른 폴더 — 아래에 전체 경로 표시)"
@@ -1343,13 +1346,19 @@ class App:
 
         result: dict = {"picked": []}
 
-        def do_delete():
-            result["picked"] = [f for bv, f in picks if bv.get()]
+        def close(picked: list[Path]):
+            # Remember where the user left the window so the next popup (and
+            # the next run of the program) opens in the same place.
+            self.cfg["dedup_popup_geometry"] = win.geometry()
+            save_config(self.cfg)
+            result["picked"] = picked
             win.destroy()
 
+        def do_delete():
+            close([f for bv, f in picks if bv.get()])
+
         def do_skip():
-            result["picked"] = []
-            win.destroy()
+            close([])
 
         btns = Frame(win)
         btns.pack(fill=X, padx=12, pady=10)
@@ -1358,6 +1367,24 @@ class App:
         win.protocol("WM_DELETE_WINDOW", do_skip)
         win.wait_window()
         return result["picked"]
+
+    def _dup_popup_geometry(self) -> str:
+        """Geometry for the duplicate-choice popup: the position the user last
+        left it at if that still lands on screen, otherwise centred over the
+        main window (never the top-left corner Tk defaults to)."""
+        default_w, default_h = 760, 380
+        remembered = self.cfg.get("dedup_popup_geometry") or ""
+        m = re.fullmatch(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", remembered)
+        if m:
+            w, h, x, y = (int(v) for v in m.groups())
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            # Keep at least part of the title bar reachable.
+            if -w + 100 < x < sw - 100 and 0 <= y < sh - 50:
+                return remembered
+        self.root.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - default_w) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - default_h) // 2
+        return f"{default_w}x{default_h}+{max(x, 0)}+{max(y, 0)}"
 
     def _run_dedup(self) -> None:
         path = self.dedup_path.get().strip()
