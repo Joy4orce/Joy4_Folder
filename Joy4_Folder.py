@@ -649,19 +649,71 @@ DUP_NEGATIVE_MARKERS = ("없음", "없는", "제거", "미포함", "無", "な�
 DUP_POSITIVE_MARKERS = ("있음", "있는", "포함", "포함된", "수록", "収録", "有", "あり", "アリ")
 
 
-def folder_file_stems(folder: Path) -> set[str]:
-    """All file stems (name without extension), lowercased, found recursively."""
-    stems: set[str] = set()
+# Files are identified by (stem, kind) so that a.mp3 and a.wav count as the
+# same track, but a.mp3 and a.txt (its script) or a.vtt (its subtitle) do not.
+AUDIO_EXTS = {".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus", ".aac", ".wma", ".aiff", ".alac"}
+VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".webm", ".flv", ".m4v", ".ts", ".mpg", ".mpeg"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+TEXT_EXTS = {".txt", ".pdf", ".html", ".htm", ".md", ".doc", ".docx"}
+MEDIA_KINDS = ("audio", "video")
+
+FileKey = tuple[str, str]  # (lowercased stem, kind)
+
+
+def file_kind(name: str) -> str:
+    ext = Path(name).suffix.lower()
+    if ext in AUDIO_EXTS:
+        return "audio"
+    if ext in VIDEO_EXTS:
+        return "video"
+    if ext in IMAGE_EXTS:
+        return "image"
+    if ext in SUBTITLE_EXTS:
+        return "subtitle"
+    if ext in TEXT_EXTS:
+        return "text"
+    return ext or "none"
+
+
+def file_key(name: str) -> FileKey:
+    return (Path(name).stem.lower(), file_kind(name))
+
+
+def folder_signature(folder: Path) -> set[FileKey]:
+    """Every file under the folder (recursively) as (stem, kind)."""
+    sig: set[FileKey] = set()
     for _cur, _subs, files in os.walk(folder):
         for f in files:
-            stems.add(Path(f).stem.lower())
-    return stems
+            sig.add(file_key(f))
+    return sig
 
 
-def _overlap_ratio(a: set[str], b: set[str]) -> float:
+def _media(sig: set[FileKey]) -> set[FileKey]:
+    return {k for k in sig if k[1] in MEDIA_KINDS}
+
+
+def _comparable(a: set[FileKey], b: set[FileKey]) -> tuple[set[FileKey], set[FileKey]]:
+    """What to compare two folders on. Duplicates are about the media: if
+    either side has audio/video, only media counts, so a scripts-only or
+    covers-only folder can never be a media folder's duplicate. Folders with
+    no media on either side fall back to comparing every file."""
+    ma, mb = _media(a), _media(b)
+    if ma or mb:
+        return ma, mb
+    return a, b
+
+
+def _overlap_ratio(a: set[FileKey], b: set[FileKey]) -> float:
+    a, b = _comparable(a, b)
     if not a or not b:
         return 0.0
     return len(a & b) / len(a | b)
+
+
+def _shares(a: set[FileKey], b: set[FileKey]) -> bool:
+    """True if the two folders have at least one comparable file in common."""
+    a, b = _comparable(a, b)
+    return bool(a & b)
 
 
 # DLsite product code (RJ + 6–8 digits, e.g. RJ123456 / RJ01234567). Two
@@ -742,10 +794,10 @@ def name_variant_group(subs: list[Path], stems: dict[Path, set[str]],
     unrelated folders aren't flagged. Returns [] if there's no such pair.
     """
     def pair_group(losers: list[Path], keepers: list[Path]) -> list[Path]:
-        rel_losers = [x for x in losers if any(stems[x] & stems[k] for k in keepers)]
+        rel_losers = [x for x in losers if any(_shares(stems[x], stems[k]) for k in keepers)]
         if not rel_losers:
             return []
-        rel_keepers = [k for k in keepers if any(stems[k] & stems[x] for x in rel_losers)]
+        rel_keepers = [k for k in keepers if any(_shares(stems[k], stems[x]) for x in rel_losers)]
         chosen = set(rel_losers) | set(rel_keepers)
         return [s for s in subs if s in chosen]
 
@@ -800,7 +852,7 @@ def scan_duplicate_folders(root: Path, recursive: bool,
             subs = [p for p in parent_dir.iterdir() if p.is_dir()]
         except OSError:
             continue
-        stems = {s: folder_file_stems(s) for s in subs}
+        stems = {s: folder_signature(s) for s in subs}
         subs = [s for s in subs if stems[s]]  # ignore empty folders
         all_stems.update({s: stems[s] for s in subs})
         if len(subs) < 2:
@@ -876,7 +928,7 @@ def _classify_cluster(cluster: list[Path], stems: dict[Path, set[str]],
         # Only auto-delete when the victim's files actually exist in a keeper,
         # so nothing unique is lost. A same-code victim that shares nothing is
         # still a duplicate product, so ask instead.
-        overlapping = [k for k in keepers if stems[v] & stems[k]]
+        overlapping = [k for k in keepers if _shares(stems[v], stems[k])]
         if overlapping:
             auto.append((v, overlapping[0].name, reason))
         elif code:
@@ -890,23 +942,25 @@ def _classify_cluster(cluster: list[Path], stems: dict[Path, set[str]],
 
 def _group_file_stats(group: list[Path]) -> dict:
     """For a duplicate group: per folder (total files, files also present in
-    another member, files only here), plus the stems present in 2+ members."""
-    stems = {f: folder_file_stems(f) for f in group}
+    another member, files only here), plus the names present in 2+ members.
+    A file counts as "present elsewhere" only as the same (stem, kind): an
+    mp3 is matched by the same track as wav, never by its script or cover."""
+    sigs = {f: folder_signature(f) for f in group}
     per_folder: dict[Path, tuple[int, int, int]] = {}
     for f in group:
-        others: set[str] = set().union(*(stems[o] for o in group if o is not f))
+        others: set[FileKey] = set().union(*(sigs[o] for o in group if o is not f))
         total = shared = 0
         for _cur, _subs, files in os.walk(f):
             for name in files:
                 total += 1
-                if Path(name).stem.lower() in others:
+                if file_key(name) in others:
                     shared += 1
         per_folder[f] = (total, shared, total - shared)
-    seen: dict[str, int] = {}
+    seen: dict[FileKey, int] = {}
     for f in group:
-        for s in stems[f]:
-            seen[s] = seen.get(s, 0) + 1
-    common = sorted(s for s, n in seen.items() if n >= 2)
+        for k in sigs[f]:
+            seen[k] = seen.get(k, 0) + 1
+    common = sorted({stem for (stem, _kind), n in seen.items() if n >= 2})
     return {"per_folder": per_folder, "common": common}
 
 
