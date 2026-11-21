@@ -659,8 +659,21 @@ def _overlap_ratio(a: set[str], b: set[str]) -> float:
     return len(a & b) / min(len(a), len(b))
 
 
-def cluster_duplicate_folders(subs: list[Path], stems: dict[Path, set[str]]) -> list[list[Path]]:
-    """Group sibling folders whose contents overlap into duplicate clusters."""
+# DLsite product code (RJ + 6–8 digits, e.g. RJ123456 / RJ01234567). Two
+# folders carrying the same code are the same product even if their names
+# differ, so they are clustered as duplicates regardless of content overlap.
+DLSITE_CODE_RE = re.compile(r"(?<![A-Za-z0-9])(RJ\d{6,8})(?!\d)", re.IGNORECASE)
+
+
+def dlsite_code(name: str) -> str | None:
+    m = DLSITE_CODE_RE.search(name)
+    return m.group(1).upper() if m else None
+
+
+def cluster_duplicate_folders(subs: list[Path], stems: dict[Path, set[str]],
+                              codes: dict[Path, str | None] | None = None) -> list[list[Path]]:
+    """Group sibling folders into duplicate clusters: by overlapping contents,
+    and by a shared DLsite code when `codes` is given."""
     parent = {s: s for s in subs}
 
     def find(x: Path) -> Path:
@@ -671,8 +684,10 @@ def cluster_duplicate_folders(subs: list[Path], stems: dict[Path, set[str]]) -> 
 
     for i in range(len(subs)):
         for j in range(i + 1, len(subs)):
-            if _overlap_ratio(stems[subs[i]], stems[subs[j]]) >= DUP_OVERLAP_THRESHOLD:
-                parent[find(subs[i])] = find(subs[j])
+            a, b = subs[i], subs[j]
+            same_code = bool(codes and codes.get(a) and codes.get(a) == codes.get(b))
+            if same_code or _overlap_ratio(stems[a], stems[b]) >= DUP_OVERLAP_THRESHOLD:
+                parent[find(a)] = find(b)
 
     clusters: dict[Path, list[Path]] = {}
     for s in subs:
@@ -755,15 +770,16 @@ def scan_duplicate_folders(root: Path, recursive: bool,
 
     Returns (auto, ambiguous):
       auto      = [(victim: Path, keeper_name: str, reason: str)] decided by rules
-      ambiguous = [cluster: list[Path]] left for the user to decide
+      ambiguous = [(cluster: list[Path], why: str)] left for the user to decide
 
-    Folders whose contents overlap are matched by rules (auto) or, if a rule
-    can't decide, surfaced for the user. When include_name_only is set, sibling
-    folders whose names look like a variant pair but whose contents DIFFER are
-    also surfaced for the user (never auto-deleted, since contents differ).
+    Folders whose contents overlap, or that share a DLsite RJ code, are matched
+    by rules (auto) or, if a rule can't decide, surfaced for the user. When
+    include_name_only is set, sibling folders whose names look like a variant
+    pair but whose contents DIFFER are also surfaced for the user (never
+    auto-deleted, since contents differ).
     """
     auto: list[tuple[Path, str, str]] = []
-    ambiguous: list[list[Path]] = []
+    ambiguous: list[tuple[list[Path], str]] = []
 
     if recursive:
         parents = [Path(cur) for cur, _s, _f in os.walk(root)]
@@ -782,21 +798,35 @@ def scan_duplicate_folders(root: Path, recursive: bool,
         if len(subs) < 2:
             continue
 
+        codes = {s: dlsite_code(s.name) for s in subs}
+
         handled: set[Path] = set()
-        for cluster in cluster_duplicate_folders(subs, stems):
+        for cluster in cluster_duplicate_folders(subs, stems, codes):
+            shared = {codes[c] for c in cluster if codes[c]}
+            code = next(iter(shared)) if len(shared) == 1 else None
+            why = f"같은 DLsite 번호 {code}" if code else "내용이 겹침"
+
             names = [c.name for c in cluster]
             victim_names, reason = decide_group_victims(names, keep_markers, delete_markers)
+            if code:
+                reason = f"{reason} · {why}" if reason else why
             victims = [c for c in cluster if c.name in victim_names]
             keepers = [c for c in cluster if c not in victims]
+            unsure: list[Path] = []
             for v in victims:
                 # Only auto-delete when the victim's files actually exist in a
-                # keeper, so nothing unique is lost.
+                # keeper, so nothing unique is lost. A same-code victim that
+                # shares nothing is still a duplicate product, so ask instead.
                 overlapping = [k for k in keepers if stems[v] & stems[k]]
                 if overlapping:
                     auto.append((v, overlapping[0].name, reason))
-            # Duplicates left undecided among the keepers still need a human.
-            if len(keepers) >= 2:
-                ambiguous.append(keepers)
+                elif code:
+                    unsure.append(v)
+            # Duplicates left undecided (keepers vs keepers, or same-code
+            # victims with no shared files) still need a human.
+            leftover = keepers + unsure
+            if len(leftover) >= 2:
+                ambiguous.append((leftover, why))
             handled.update(cluster)
 
         # Name-paired siblings whose contents partially overlap: ask, don't
@@ -805,7 +835,7 @@ def scan_duplicate_folders(root: Path, recursive: bool,
             remaining = [s for s in subs if s not in handled]
             nv = name_variant_group(remaining, stems, keep_markers, delete_markers)
             if len(nv) >= 2:
-                ambiguous.append(nv)
+                ambiguous.append((nv, "이름이 짝(있음/없음·mp3/wav 등)이고 일부 파일이 겹침"))
 
     return auto, ambiguous
 
@@ -1045,7 +1075,7 @@ class App:
 
         Label(
             f5, fg="#777",
-            text=("mp3>wav · '있음/포함' 우선, '없음/제거' 삭제 · 판단 불가 시 직접 선택\n"
+            text=("mp3>wav · '있음/포함' 우선, '없음/제거' 삭제 · 같은 RJ 번호는 중복 · 판단 불가 시 직접 선택\n"
                   "위 칸에 폴더 이름에 포함될 문자열을 쉼표로 구분해 적으면 규칙에 추가됩니다 "
                   "(예: 삭제할 폴더 이름 = 통상판, 미포함). '남길 폴더'는 삭제되지 않습니다."),
             justify=LEFT,
@@ -1233,21 +1263,25 @@ class App:
         return box.get("value")
 
     def _ask_duplicate_choice(self, group: list[Path],
-                              index: int = 1, total: int = 1) -> list[Path]:
+                              index: int = 1, total: int = 1,
+                              why: str = "") -> list[Path]:
         """Modal chooser for an ambiguous duplicate group. Returns folders to
         delete (possibly empty = skip). Must run on the main thread.
-        index/total show progress across all pending popups, e.g. (5/17)."""
+        index/total show progress across all pending popups, e.g. (5/17);
+        `why` says what made these folders look like duplicates."""
         counter = f"({index}/{total})"
         win = Toplevel(self.root)
         win.title(f"중복 폴더 확인 {counter}")
         win.transient(self.root)
         win.grab_set()
-        win.geometry("760x360")
+        win.geometry("760x380")
 
         parent = group[0].parent
+        why_line = f"판단 근거: {why}\n" if why else ""
         Label(
             win, justify=LEFT, anchor=W, wraplength=720,
-            text=(f"[{counter}] 다음 위치에서 중복일 수 있는 폴더입니다 (자동 판단 불가).\n{parent}\n\n"
+            text=(f"[{counter}] 다음 위치에서 중복일 수 있는 폴더입니다 (자동 판단 불가).\n{parent}\n"
+                  f"{why_line}\n"
                   "파일 개수를 참고해 삭제할 폴더를 선택하세요. "
                   "(아무것도 선택하지 않으면 건너뜁니다)"),
         ).pack(fill=X, padx=12, pady=(12, 6))
@@ -1323,9 +1357,9 @@ class App:
         total_amb = len(ambiguous)
         if ambiguous:
             log(f"[중복 정리] 자동 판단이 어려운 중복 {total_amb}건 → 직접 선택 창을 엽니다.")
-        for i, group in enumerate(ambiguous, start=1):
+        for i, (group, why) in enumerate(ambiguous, start=1):
             picked = self._call_on_main(
-                lambda g=group, idx=i: self._ask_duplicate_choice(g, idx, total_amb)
+                lambda g=group, idx=i, w=why: self._ask_duplicate_choice(g, idx, total_amb, w)
             )
             for p in picked:
                 log(f"  [선택] 삭제 예정: {p.name}")
