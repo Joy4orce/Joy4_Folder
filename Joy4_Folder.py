@@ -780,64 +780,106 @@ def scan_duplicate_folders(root: Path, recursive: bool,
     """
     auto: list[tuple[Path, str, str]] = []
     ambiguous: list[tuple[list[Path], str]] = []
+    handled: set[Path] = set()
 
     if recursive:
         parents = [Path(cur) for cur, _s, _f in os.walk(root)]
     else:
         parents = [root]
 
+    # Pass 1 — per parent: sibling folders whose contents overlap.
+    all_stems: dict[Path, set[str]] = {}
+    sibling_sets: list[list[Path]] = []
     for parent_dir in parents:
         try:
             subs = [p for p in parent_dir.iterdir() if p.is_dir()]
         except OSError:
             continue
-        if len(subs) < 2:
-            continue
         stems = {s: folder_file_stems(s) for s in subs}
         subs = [s for s in subs if stems[s]]  # ignore empty folders
+        all_stems.update({s: stems[s] for s in subs})
         if len(subs) < 2:
             continue
-
-        codes = {s: dlsite_code(s.name) for s in subs}
-
-        handled: set[Path] = set()
-        for cluster in cluster_duplicate_folders(subs, stems, codes):
-            shared = {codes[c] for c in cluster if codes[c]}
-            code = next(iter(shared)) if len(shared) == 1 else None
-            why = f"같은 DLsite 번호 {code}" if code else "내용이 겹침"
-
-            names = [c.name for c in cluster]
-            victim_names, reason = decide_group_victims(names, keep_markers, delete_markers)
-            if code:
-                reason = f"{reason} · {why}" if reason else why
-            victims = [c for c in cluster if c.name in victim_names]
-            keepers = [c for c in cluster if c not in victims]
-            unsure: list[Path] = []
-            for v in victims:
-                # Only auto-delete when the victim's files actually exist in a
-                # keeper, so nothing unique is lost. A same-code victim that
-                # shares nothing is still a duplicate product, so ask instead.
-                overlapping = [k for k in keepers if stems[v] & stems[k]]
-                if overlapping:
-                    auto.append((v, overlapping[0].name, reason))
-                elif code:
-                    unsure.append(v)
-            # Duplicates left undecided (keepers vs keepers, or same-code
-            # victims with no shared files) still need a human.
-            leftover = keepers + unsure
-            if len(leftover) >= 2:
-                ambiguous.append((leftover, why))
+        sibling_sets.append(subs)
+        for cluster in cluster_duplicate_folders(subs, stems):
+            code = _shared_code(cluster)
+            _classify_cluster(cluster, all_stems, code, keep_markers, delete_markers,
+                              auto, ambiguous)
             handled.update(cluster)
 
-        # Name-paired siblings whose contents partially overlap: ask, don't
-        # auto-delete. Folders sharing no files with a keeper are skipped.
-        if include_name_only:
+    # Pass 2 — library-wide: every folder carrying the same DLsite code is the
+    # same product, wherever it sits in the tree.
+    by_code: dict[str, list[Path]] = {}
+    for folder in all_stems:
+        code = dlsite_code(folder.name)
+        if code:
+            by_code.setdefault(code, []).append(folder)
+    auto_victims = {v for v, _k, _r in auto}
+    for code, members in by_code.items():
+        # A folder nested inside another with the same code is part of it, not
+        # a duplicate of it; and anything already queued for deletion is gone.
+        members = [m for m in members
+                   if m not in auto_victims
+                   and not any(o is not m and _is_within(m, o) for o in members)]
+        if len(members) < 2:
+            continue
+        # Pass 1 may have already queued a popup for some of these; replace it
+        # with the complete group so the user sees everything in one place.
+        group = set(members)
+        ambiguous[:] = [(g, w) for g, w in ambiguous if not set(g) <= group]
+        _classify_cluster(members, all_stems, code, keep_markers, delete_markers,
+                          auto, ambiguous)
+        handled.update(members)
+
+    # Pass 3 — per parent: name-paired siblings whose contents partially
+    # overlap. Ask, don't auto-delete; folders sharing no files are skipped.
+    if include_name_only:
+        for subs in sibling_sets:
             remaining = [s for s in subs if s not in handled]
-            nv = name_variant_group(remaining, stems, keep_markers, delete_markers)
+            nv = name_variant_group(remaining, all_stems, keep_markers, delete_markers)
             if len(nv) >= 2:
                 ambiguous.append((nv, "이름이 짝(있음/없음·mp3/wav 등)이고 일부 파일이 겹침"))
 
     return auto, ambiguous
+
+
+def _shared_code(cluster: list[Path]) -> str | None:
+    """The one DLsite code all coded members of a cluster share, if any."""
+    codes = {c for c in (dlsite_code(p.name) for p in cluster) if c}
+    return next(iter(codes)) if len(codes) == 1 else None
+
+
+def _classify_cluster(cluster: list[Path], stems: dict[Path, set[str]],
+                      code: str | None, keep_markers: tuple, delete_markers: tuple,
+                      auto: list, ambiguous: list) -> None:
+    """Decide what to do with one duplicate cluster: queue rule-decided victims
+    for auto-delete, and anything still unresolved for the user."""
+    spread = len({p.parent for p in cluster}) > 1
+    why = f"같은 DLsite 번호 {code}" if code else "내용이 겹침"
+    if spread:
+        why += " · 서로 다른 폴더에 있음"
+
+    names = [c.name for c in cluster]
+    victim_names, reason = decide_group_victims(names, keep_markers, delete_markers)
+    if code:
+        reason = f"{reason} · {why}" if reason else why
+    victims = [c for c in cluster if c.name in victim_names]
+    keepers = [c for c in cluster if c not in victims]
+    unsure: list[Path] = []
+    for v in victims:
+        # Only auto-delete when the victim's files actually exist in a keeper,
+        # so nothing unique is lost. A same-code victim that shares nothing is
+        # still a duplicate product, so ask instead.
+        overlapping = [k for k in keepers if stems[v] & stems[k]]
+        if overlapping:
+            auto.append((v, overlapping[0].name, reason))
+        elif code:
+            unsure.append(v)
+    # Duplicates left undecided (keepers vs keepers, or same-code victims with
+    # no shared files) still need a human.
+    leftover = keepers + unsure
+    if len(leftover) >= 2:
+        ambiguous.append((leftover, why))
 
 
 def _is_within(child: Path, parent: Path) -> bool:
@@ -1276,11 +1318,12 @@ class App:
         win.grab_set()
         win.geometry("760x380")
 
-        parent = group[0].parent
+        same_parent = len({f.parent for f in group}) == 1
+        where = str(group[0].parent) if same_parent else "(서로 다른 폴더 — 아래에 전체 경로 표시)"
         why_line = f"판단 근거: {why}\n" if why else ""
         Label(
             win, justify=LEFT, anchor=W, wraplength=720,
-            text=(f"[{counter}] 다음 위치에서 중복일 수 있는 폴더입니다 (자동 판단 불가).\n{parent}\n"
+            text=(f"[{counter}] 다음 위치에서 중복일 수 있는 폴더입니다 (자동 판단 불가).\n{where}\n"
                   f"{why_line}\n"
                   "파일 개수를 참고해 삭제할 폴더를 선택하세요. "
                   "(아무것도 선택하지 않으면 건너뜁니다)"),
@@ -1294,7 +1337,7 @@ class App:
             bv = BooleanVar(value=False)
             Checkbutton(
                 listbox, variable=bv, anchor=W, justify=LEFT, wraplength=700,
-                text=f"[파일 {count}개]  {folder.name}",
+                text=f"[파일 {count}개]  {folder.name if same_parent else folder}",
             ).pack(fill=X, anchor=W)
             picks.append((bv, folder))
 
